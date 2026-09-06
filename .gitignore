@@ -1,0 +1,12 @@
+﻿# 敏感凭证与本地端点文件（严禁提交）
+新建文本文档.txt
+*.txt
+.env
+*.token
+
+# Python 运行时与编辑临时文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.un~
+*~
