@@ -211,16 +211,67 @@ def parse_choice_index(text: str) -> int | None:
                 return idx
     return None
 
-# --- 功能 1：搜索歌曲候选列表（提供多个结果让用户语音选择） ---
+SEARCH_CACHE_ALL_ITEMS = []
+SEARCH_CACHE_PAGE = 0
+SEARCH_PAGE_SIZE = 5
+CURRENT_SEARCH_QUERY = ""
+
+def format_page_options(query: str, page_idx: int) -> dict:
+    global LAST_SEARCH_OPTIONS, SEARCH_CACHE_ALL_ITEMS, SEARCH_CACHE_PAGE
+    start = page_idx * SEARCH_PAGE_SIZE
+    end = start + SEARCH_PAGE_SIZE
+    page_items = SEARCH_CACHE_ALL_ITEMS[start:end]
+
+    if not page_items:
+        return {
+            "status": "end_of_results",
+            "message": f"关于《{query}》的所有精选版本都已经浏览完毕了，您可以尝试更具体的歌名搜索！",
+            "instruction": "请告知用户已经看完了所有相关版本，询问用户想听哪一首，或者想换什么新歌搜索。"
+        }
+
+    SEARCH_CACHE_PAGE = page_idx
+    options = []
+    for idx, item in enumerate(page_items):
+        options.append({
+            "index": idx + 1,
+            "title": item["title"],
+            "channel": item["channel"],
+            "video_id": item["video_id"]
+        })
+    LAST_SEARCH_OPTIONS = options
+
+    page_num = page_idx + 1
+    total_pages = (len(SEARCH_CACHE_ALL_ITEMS) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE
+    notify_log("HIT", f"展示第 {page_num}/{total_pages} 批 (本批 {len(options)} 首, 候选池 {len(SEARCH_CACHE_ALL_ITEMS)} 首)")
+
+    readable_list = [f"{idx+1}. {opt['title']}" for idx, opt in enumerate(options)]
+    
+    return {
+        "status": "multiple_results",
+        "query": query,
+        "batch_page": page_num,
+        "total_batches": total_pages,
+        "options_count": len(options),
+        "total_pool": len(SEARCH_CACHE_ALL_ITEMS),
+        "options": options,
+        "instruction": (
+            f"【播报指引】全网共搜到了海量版本，已为用户精选出第 {page_num} 批候选（共 5 首）：\n"
+            f"{'; '.join(readable_list)}。\n"
+            "【语言表达要求】请用亲切自然的口语告诉用户：'在全网为您找到了许多相关版本，精选推荐前 5 个：1. xxx 2. xxx ... 5. xxx。您想听第几个？如果都不喜欢，也可以对我说【换一批】。'\n"
+            "【严禁】切勿在此时调用设备播放工具 self.audio.play_url，等待用户回答序号（如“第1个”、“放第二个”）、说出歌名或说【换一批】。"
+        )
+    }
+
+# --- 功能 1：搜索歌曲候选列表（默认提供 5 个精选结果供用户语音挑选） ---
 @mcp.tool()
-def search_music_options(query: str, count: int = 3) -> str:
+def search_music_options(query: str, count: int = 5) -> str:
     """
     【搜索歌曲/候选版本挑选】当用户要求“搜索歌曲”、“找找某某的歌”、“搜一下xxx”、“有哪些版本”、“查一下某歌”或泛指歌手名时调用。
-    返回 3 个候选歌曲版本，由大模型用语音念给用户听并等待用户语音回答挑选第几个。
+    全网检索海量版本，默认精选推荐前 5 个版本念给用户听并等待用户挑选；用户也可说“换一批”。
     :param query: 想要搜索的歌曲关键词、歌名或歌手名
-    :param count: 候选数量，默认 3 首 (1~5)
+    :param count: 候选数量，默认 5 首
     """
-    global LAST_SEARCH_OPTIONS
+    global SEARCH_CACHE_ALL_ITEMS, SEARCH_CACHE_PAGE, CURRENT_SEARCH_QUERY
     print(f"\n[DEBUG 搜索歌曲候选] query: '{query}', count={count}", file=sys.stderr, flush=True)
     notify_log("SEARCH", f"候选检索: '{query}'")
 
@@ -234,47 +285,73 @@ def search_music_options(query: str, count: int = 3) -> str:
         return json.dumps({"status": "error", "message": "未配置 YouTube API Key"}, ensure_ascii=False)
 
     cleaned_q = clean_song_query(query)
-    num = max(1, min(int(count), 5))
     try:
-        items = search_videos(cleaned_q, api_key, max_results=num)
+        # 一次性预取 15 个候选项入池，以便用户说“换一批”时秒级切换（每批 5 首，共 3 批）
+        items = search_videos(cleaned_q, api_key, max_results=15)
         if not items and cleaned_q != query:
-            items = search_videos(query, api_key, max_results=num)
+            items = search_videos(query, api_key, max_results=15)
 
         if not items:
             notify_log("NOT_FOUND", f"未找到候选: '{query}'")
             return json.dumps({"status": "not_found", "message": f"在 YouTube 上未找到与《{query}》相关的歌曲"}, ensure_ascii=False)
 
-        options = []
+        pool = []
         for idx, item in enumerate(items):
             vid = item.get("id", {}).get("videoId", "")
             snip = item.get("snippet", {})
             title = snip.get("title", f"选项 {idx+1}")
             channel = snip.get("channelTitle", "")
-            options.append({
-                "index": idx + 1,
-                "title": title,
-                "channel": channel,
-                "video_id": vid
-            })
+            if vid:
+                pool.append({
+                    "title": title,
+                    "channel": channel,
+                    "video_id": vid
+                })
 
-        LAST_SEARCH_OPTIONS = options
-        notify_log("HIT", f"找到 {len(options)} 首候选 (首选: {options[0]['title'][:18]})")
+        SEARCH_CACHE_ALL_ITEMS = pool
+        CURRENT_SEARCH_QUERY = query
+        SEARCH_CACHE_PAGE = 0
 
-        return json.dumps({
-            "status": "multiple_results",
-            "query": query,
-            "total": len(options),
-            "options": options,
-            "instruction": (
-                "【重要指令】请用亲切简短的中文口语向用户朗读找到的这些选项（例如：'为您找到了几个版本：第一个是xxx，第二个是xxx，请问您想听第几个？'）。"
-                "【禁止】此时切勿调用设备播放工具 self.audio.play_url，必须等待用户回答序号（如“第1个”、“放第二个”）或选定具体版本后，"
-                "再调用 play_selected_song 工具（传入对应选项的 video_id）来进行播放。"
-            )
-        }, ensure_ascii=False)
+        res = format_page_options(query, 0)
+        return json.dumps(res, ensure_ascii=False)
     except Exception as e:
         print(f"[YouTube 候选搜索异常] {e}", file=sys.stderr, flush=True)
         notify_log("ERROR", f"候选搜索异常: {e}")
         return json.dumps({"status": "error", "message": f"搜索异常: {e}"}, ensure_ascii=False)
+
+# --- 功能 2：换一批候选歌曲 ---
+@mcp.tool()
+def next_music_options() -> str:
+    """
+    【换一批歌曲候选】当用户对上一批候选不满意，说“换一批”、“下一批”、“换一组”、“还有其他的吗”、“再找找”、“看后面的”时调用。
+    自动切换展示后续的 5 首精选版本念给用户听。
+    """
+    global SEARCH_CACHE_ALL_ITEMS, SEARCH_CACHE_PAGE, CURRENT_SEARCH_QUERY
+    print(f"\n[DEBUG 换一批候选请求] 当前页: {SEARCH_CACHE_PAGE}, 备选池: {len(SEARCH_CACHE_ALL_ITEMS)} 首", file=sys.stderr, flush=True)
+    notify_log("MCP_CALL", "换一批歌曲候选")
+
+    if not SEARCH_CACHE_ALL_ITEMS:
+        return json.dumps({
+            "status": "no_previous_search",
+            "message": "当前还没有搜索过歌曲哦，请先告诉我你想搜索什么歌，例如‘搜一下周杰伦的歌’！",
+            "instruction": "告知用户还没有进行过搜索，询问用户想搜哪位歌手或哪首歌。"
+        }, ensure_ascii=False)
+
+    next_page = SEARCH_CACHE_PAGE + 1
+    total_pages = (len(SEARCH_CACHE_ALL_ITEMS) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE
+
+    if next_page >= total_pages:
+        # 已到末尾，循环回第 1 批
+        SEARCH_CACHE_PAGE = 0
+        res = format_page_options(CURRENT_SEARCH_QUERY, 0)
+        res["instruction"] = (
+            "所有候选版本已经全部浏览完毕，已为您重新循环回到第 1 批精选推荐。"
+            "请告诉用户：'已经为您浏览完全部候选，已为您转回第 1 批推荐，您想听哪一个，或者想换个新歌？'"
+        )
+        return json.dumps(res, ensure_ascii=False)
+
+    res = format_page_options(CURRENT_SEARCH_QUERY, next_page)
+    return json.dumps(res, ensure_ascii=False)
 
 # --- 功能 2：播放用户选中的歌曲 ---
 @mcp.tool()
@@ -342,12 +419,17 @@ def play_my_music(song_name: str) -> str:
     print(f"\n[DEBUG 收到点歌请求] 查找歌名: '{song_name}'", file=sys.stderr, flush=True)
     notify_log("MCP_CALL", f"收到点歌: '{song_name}'")
 
-    # 兼容容错：如果用户在上一轮多选后回答“第1个”，而模型误调了 play_my_music
+    # 兼容容错 1：如果用户说“换一批”，而模型误调了 play_my_music
+    if any(phrase in song_name for phrase in ["换一批", "下一批", "换一组", "下一页", "更多版本", "其他版本", "还有吗", "还有别的吗"]):
+        print(f"[DEBUG 自动重定向] 识别到换一批指令: '{song_name}' -> 触发 next_music_options()\n", file=sys.stderr, flush=True)
+        return next_music_options()
+
+    # 兼容容错 2：如果用户在上一轮多选后回答“第1个”，而模型误调了 play_my_music
     choice_idx = parse_choice_index(song_name)
     if choice_idx is not None and LAST_SEARCH_OPTIONS and 0 <= choice_idx < len(LAST_SEARCH_OPTIONS):
         sel = LAST_SEARCH_OPTIONS[choice_idx]
         print(f"[DEBUG 自动重定向] 识别到序号选择: {song_name} -> 播放候选《{sel['title']}》\n", file=sys.stderr, flush=True)
-        return play_selected_song(sel["video_id"], sel["title"])
+        return play_selected_song(sel.get("video_id") or "1", sel["title"])
 
     # 1. 优先在本地私有曲库中查找（必须同时确认本地文件实际存在）
     cleaned_name = clean_song_query(song_name)
