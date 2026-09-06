@@ -37,6 +37,31 @@ def add_log(event_type: str, message: str, detail: str = ""):
         if len(LOG_BUFFER) > 60:
             LOG_BUFFER.pop(0)
 
+METADATA_FILE = DOWNLOADS_DIR / "metadata.json"
+
+def load_metadata() -> dict:
+    if METADATA_FILE.exists():
+        try:
+            with open(METADATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_metadata(video_id: str, title: str, channel: str = ""):
+    try:
+        data = load_metadata()
+        data[video_id] = {
+            "title": title,
+            "channel": channel,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "timestamp": time.time()
+        }
+        with open(METADATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Metadata Error] {e}", file=sys.stderr, flush=True)
+
 def cleanup_old_downloads(max_count: int = MAX_CACHED_SONGS):
     """当下载的音乐超过 max_count 首时，删除最早下载的文件，最多保留 max_count 首"""
     try:
@@ -45,12 +70,23 @@ def cleanup_old_downloads(max_count: int = MAX_CACHED_SONGS):
             # 按照修改时间从小到大排序（最旧的排在最前）
             mp3_files.sort(key=lambda p: p.stat().st_mtime)
             remove_count = len(mp3_files) - max_count
+            meta = load_metadata()
+            meta_changed = False
             for p in mp3_files[:remove_count]:
                 try:
                     p.unlink(missing_ok=True)
+                    if p.stem in meta:
+                        del meta[p.stem]
+                        meta_changed = True
                     print(f"[Cache Cleanup] 缓存歌曲超过 {max_count} 首，已自动清理最早下载的文件: {p.name}")
                 except Exception as err:
                     print(f"[Cache Cleanup Error] 无法删除文件 {p.name}: {err}")
+            if meta_changed:
+                try:
+                    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[Cache Cleanup Error] 检查清理缓存失败: {e}")
 
@@ -243,20 +279,25 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
         if path == "/api/prepare":
             qs = urllib.parse.parse_qs(parsed.query)
             video_id = qs.get("v", [""])[0].strip()
+            title = qs.get("title", [""])[0].strip()
+            channel = qs.get("channel", [""])[0].strip()
             if not video_id:
                 self.send_error(400, "Missing videoId")
                 return
             
+            if title:
+                save_metadata(video_id, title, channel)
+
             cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
             if cache_file.exists():
-                add_log("PREPARE", f"预热命中本地缓存: {video_id}", "已存在完整文件")
+                add_log("PREPARE", f"预热命中本地缓存: {title or video_id}", "已存在完整文件")
                 self._send_json({"ok": True, "cached": True, "videoId": video_id})
                 return
 
             session = stream_manager.get_or_create(video_id)
             # 等待 2.5 秒快速预缓冲约 32KB
             ready = session.wait_for_buffer(min_bytes=32768, timeout=2.5) if session else True
-            add_log("PREPARE", f"预热推流管道: {video_id}", f"buffered: {session.total_bytes if session else 0} B, ready={ready}")
+            add_log("PREPARE", f"预热推流管道: {title or video_id}", f"buffered: {session.total_bytes if session else 0} B, ready={ready}")
             self._send_json({
                 "ok": True,
                 "cached": False,
@@ -328,11 +369,15 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
 
     def handle_cached(self, parsed):
         try:
+            meta = load_metadata()
             cached_list = []
             for p in sorted(DOWNLOADS_DIR.glob("*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True):
                 stat = p.stat()
+                m = meta.get(p.stem, {})
                 cached_list.append({
                     "videoId": p.stem,
+                    "title": m.get("title", p.name),
+                    "channel": m.get("channel", "YouTube 点播"),
                     "fileName": p.name,
                     "sizeMb": round(stat.st_size / (1024 * 1024), 2),
                     "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),

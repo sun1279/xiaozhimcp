@@ -80,6 +80,32 @@ def make_music_result(song_name: str, artist: str, audio_url: str) -> dict:
     }
 
 ROOT_DIR = Path(__file__).resolve().parent
+DOWNLOADS_DIR = ROOT_DIR / "downloads"
+DOWNLOADS_DIR.mkdir(exist_ok=True)
+METADATA_FILE = DOWNLOADS_DIR / "metadata.json"
+
+def load_metadata() -> dict:
+    if METADATA_FILE.exists():
+        try:
+            with open(METADATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_metadata(video_id: str, title: str, channel: str = ""):
+    try:
+        data = load_metadata()
+        data[video_id] = {
+            "title": title,
+            "channel": channel,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "timestamp": time.time()
+        }
+        with open(METADATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Metadata Error] {e}", file=sys.stderr, flush=True)
 
 def notify_log(event_type: str, msg: str):
     """尝试将事件发送到流媒体日志缓冲区"""
@@ -137,11 +163,14 @@ def search_youtube_and_stream(query: str) -> dict:
 
         print(f"[YouTube 命中] 《{title}》 ID: {video_id}，正在通知流服务器预缓冲...", file=sys.stderr, flush=True)
         notify_log("HIT", f"命中《{title}》({channel}) ID: {video_id}")
+        save_metadata(video_id, title, channel)
 
         # 触发本地流服务器预缓冲 (等待几秒首包缓冲完成)
         try:
+            enc_t = urllib.parse.quote(title)
+            enc_c = urllib.parse.quote(channel)
             req = urllib.request.Request(
-                f"http://127.0.0.1:{SERVER_PORT}/api/prepare?v={video_id}",
+                f"http://127.0.0.1:{SERVER_PORT}/api/prepare?v={video_id}&title={enc_t}&channel={enc_c}",
                 headers={"User-Agent": "XiaozhiMCP/1.0"}
             )
             with urllib.request.urlopen(req, timeout=4) as resp:
@@ -265,22 +294,32 @@ def play_selected_song(video_id_or_index: str, title: str = "") -> str:
     # 1. 序号索引解析
     if choice_idx is not None and LAST_SEARCH_OPTIONS and 0 <= choice_idx < len(LAST_SEARCH_OPTIONS):
         sel = LAST_SEARCH_OPTIONS[choice_idx]
+        if sel.get("url") and not sel.get("video_id"):
+            # 命中了本地内置常驻曲目（如晴天、稻香）
+            print(f"[DEBUG 播放内置常驻曲目] 《{sel['title']}》 -> {sel['url']}\n", file=sys.stderr, flush=True)
+            notify_log("LOCAL_HIT", f"选中本地内置: {sel['title']}")
+            return json.dumps(make_music_result(sel["title"], sel.get("channel", "精选曲库"), sel["url"]), ensure_ascii=False)
         video_id = sel["video_id"]
         title = title or sel["title"]
     elif len(video_id) != 11 and LAST_SEARCH_OPTIONS:
         # 2. 如果不是11位ID，尝试按标题关键字模糊匹配
         for opt in LAST_SEARCH_OPTIONS:
             if target.lower() in opt["title"].lower() or (title and title.lower() in opt["title"].lower()):
+                if opt.get("url") and not opt.get("video_id"):
+                    return json.dumps(make_music_result(opt["title"], opt.get("channel", "精选曲库"), opt["url"]), ensure_ascii=False)
                 video_id = opt["video_id"]
                 title = opt["title"]
                 break
 
     notify_log("HIT", f"选中播放: {title or video_id} (ID: {video_id})")
+    if title:
+        save_metadata(video_id, title)
 
     # 预缓冲
     try:
+        enc_t = urllib.parse.quote(title) if title else ""
         req = urllib.request.Request(
-            f"http://127.0.0.1:{SERVER_PORT}/api/prepare?v={video_id}",
+            f"http://127.0.0.1:{SERVER_PORT}/api/prepare?v={video_id}&title={enc_t}",
             headers={"User-Agent": "XiaozhiMCP/1.0"}
         )
         with urllib.request.urlopen(req, timeout=4) as resp:
@@ -339,39 +378,134 @@ def search_and_play_youtube(song_name: str) -> str:
     res = search_youtube_and_stream(song_name)
     return json.dumps(res, ensure_ascii=False)
 
-# --- 功能 3：列出曲库中的所有歌曲 ---
+# --- 功能 5：查看最近播放/推荐歌单 ---
 @mcp.tool()
 def list_music_library() -> str:
     """
-    【列出歌单】当用户询问“有什么歌”、“有什么歌曲”、“列出歌单”、“曲库列表”、“你能放什么歌”时调用。
+    【查看最近歌单/常听历史】当用户询问“有什么歌”、“你能放什么歌”、“列出歌单”、“播放历史”、“最近听了什么”、“推荐歌单”时调用。
+    返回用户最近点播和缓存的历史歌曲列表，供用户重温或挑选播放。
     """
+    global LAST_SEARCH_OPTIONS
     print(f"\n[DEBUG 收到查询歌单请求]", file=sys.stderr, flush=True)
-    songs_list = []
+    notify_log("MCP_CALL", "查询最近歌单与历史")
+
+    meta = load_metadata()
+    recent_songs = []
+
+    # 1. 扫描本地已缓存的完整 MP3 文件
+    if DOWNLOADS_DIR.exists():
+        cached_files = sorted(
+            [p for p in DOWNLOADS_DIR.glob("*.mp3") if p.is_file()],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True
+        )
+        for p in cached_files:
+            vid = p.stem
+            info = meta.get(vid, {})
+            title = info.get("title", "")
+            channel = info.get("channel", "YouTube 点播")
+            if not title:
+                title = f"缓存歌曲 ({vid})"
+            recent_songs.append({
+                "title": title,
+                "channel": channel,
+                "video_id": vid,
+                "url": f"{BASE_URL}/stream/{vid}.mp3"
+            })
+
+    # 2. 追加本地精选常驻曲目（如晴天、稻香）
     for name, info in MUSIC_LIBRARY.items():
-        songs_list.append({
-            "song": name,
-            "artist": info["artist"],
-            "genre": info["genre"]
+        fname = Path(info["url"]).name
+        if (ROOT_DIR / fname).exists():
+            if not any(s["title"] == name or name in s["title"] for s in recent_songs):
+                recent_songs.append({
+                    "title": f"{name} - {info['artist']}",
+                    "channel": info["artist"],
+                    "video_id": "",
+                    "url": info["url"]
+                })
+
+    display_songs = recent_songs[:6]
+    if not display_songs:
+        return json.dumps({
+            "status": "success",
+            "message": "当前暂无本地常听歌曲。但我支持点播全网任意 YouTube 音乐，你可以直接告诉我你想听什么！",
+            "instruction": "请告诉用户当前曲库为空，但随时可点播全网任何音乐，询问用户想听谁的歌。"
+        }, ensure_ascii=False)
+
+    # 存入选择缓存，以便用户立即说“播放第一首”时能生效
+    options = []
+    for idx, s in enumerate(display_songs):
+        options.append({
+            "index": idx + 1,
+            "title": s["title"],
+            "channel": s["channel"],
+            "video_id": s["video_id"],
+            "url": s.get("url", "")
         })
-    print(f"[DEBUG 导出歌单] 共 {len(songs_list)} 首歌曲\n", file=sys.stderr, flush=True)
+    LAST_SEARCH_OPTIONS = options
+
+    readable_list = [f"{idx+1}. {s['title']}" for idx, s in enumerate(display_songs)]
+    print(f"[DEBUG 导出最近歌单] 共 {len(display_songs)} 首歌曲: {readable_list}", file=sys.stderr, flush=True)
+
     return json.dumps({
         "status": "success",
-        "total": len(songs_list),
-        "songs": songs_list,
-        "message": f"本地私有曲库中共有 {len(songs_list)} 首歌曲：{', '.join([s['song'] for s in songs_list])}。同时也支持点播任何 YouTube 音乐！"
+        "total": len(display_songs),
+        "songs": options,
+        "message": f"最近点播与常听的歌曲有：{'; '.join(readable_list)} 等。",
+        "instruction": (
+            f"请用自然的口吻向用户介绍最近常听的歌曲列表（例如：'你最近点播过的歌曲有：{readable_list[0]}、{readable_list[1]} 等。你想听哪一首，或者想点播其他新歌？'）。"
+            "此时切勿调用播放工具，等待用户回复第几首或指定歌名后再调用 play_selected_song 或 play_my_music 播放。"
+        )
     }, ensure_ascii=False)
 
-# --- 功能 4：随机播放一首歌曲 ---
+# --- 功能 6：随机播放一首歌曲 ---
 @mcp.tool()
 def play_random_music() -> str:
     """
     【随机点歌】当用户说“随便放首歌”、“推荐一首歌”、“随机播放音乐”、“来点音乐”时调用。
+    从用户最近常听/缓存的曲库中随机抽选一首播放。
     """
+    global LAST_SEARCH_OPTIONS
     print(f"\n[DEBUG 收到随机播放请求]", file=sys.stderr, flush=True)
-    name = random.choice(list(MUSIC_LIBRARY.keys()))
-    info = MUSIC_LIBRARY[name]
-    print(f"[DEBUG 随机抽取] 抽中《{name}》- {info['artist']} -> {info['url']}\n", file=sys.stderr, flush=True)
-    return json.dumps(make_music_result(name, info["artist"], info["url"]), ensure_ascii=False)
+    notify_log("MCP_CALL", "随机播放音乐")
+
+    meta = load_metadata()
+    candidates = []
+
+    # 1. 收集本地已缓存的 MP3
+    if DOWNLOADS_DIR.exists():
+        for p in DOWNLOADS_DIR.glob("*.mp3"):
+            if p.is_file():
+                info = meta.get(p.stem, {})
+                title = info.get("title", f"音乐 {p.stem}")
+                channel = info.get("channel", "YouTube")
+                candidates.append({
+                    "title": title,
+                    "channel": channel,
+                    "video_id": p.stem,
+                    "url": f"{BASE_URL}/stream/{p.stem}.mp3"
+                })
+
+    # 2. 收集本地精选
+    for name, info in MUSIC_LIBRARY.items():
+        fname = Path(info["url"]).name
+        if (ROOT_DIR / fname).exists():
+            candidates.append({
+                "title": f"{name} - {info['artist']}",
+                "channel": info["artist"],
+                "video_id": "",
+                "url": info["url"]
+            })
+
+    if not candidates:
+        # 如果什么缓存都没有，默认点播周杰伦
+        return play_my_music("周杰伦 晴天")
+
+    chosen = random.choice(candidates)
+    print(f"[DEBUG 随机抽取] 抽中《{chosen['title']}》 -> {chosen['url']}\n", file=sys.stderr, flush=True)
+    notify_log("HIT", f"随机抽中: {chosen['title']}")
+    return json.dumps(make_music_result(chosen["title"], chosen["channel"], chosen["url"]), ensure_ascii=False)
 
 if __name__ == "__main__":
     mcp.run()

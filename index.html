@@ -879,10 +879,10 @@
           html += data.cached.map(c => `
             <div class="song-card" id="card-${c.videoId}">
               <div class="card-body">
-                <div class="song-title">${c.fileName}</div>
-                <div class="song-channel">📅 ${c.time} · ${c.sizeMb} MB</div>
+                <div class="song-title" title="${c.title || c.fileName}">${c.title || c.fileName}</div>
+                <div class="song-channel">${c.channel ? '📺 ' + c.channel + ' · ' : ''}📅 ${c.time} · ${c.sizeMb} MB</div>
                 <div class="card-actions">
-                  <button class="btn btn-sm btn-play" onclick="playTrack('${c.fileName}', 'YouTube Cached', '${API_BASE}${c.streamUrl}', '')">▶️ 播放</button>
+                  <button class="btn btn-sm btn-play" onclick="playTrack('${(c.title || c.fileName).replace(/'/g, "\\'")}', '${(c.channel || 'YouTube').replace(/'/g, "\\'")}', '${API_BASE}${c.streamUrl}', '')">▶️ 播放</button>
                   <button class="btn btn-sm btn-outline" onclick="copyLink('${API_BASE}${c.streamUrl}')">📋 复制直链</button>
                   <button class="btn btn-sm btn-outline btn-delete" onclick="deleteCached('${c.videoId}')">🗑️ 删除</button>
                 </div>
