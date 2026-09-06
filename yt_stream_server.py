@@ -13,6 +13,13 @@ ROOT_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = ROOT_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
+try:
+    from youtube_search_demo import search_videos, load_api_key
+    YOUTUBE_SEARCH_AVAILABLE = True
+except Exception as e:
+    print(f"[WARN] 导入 youtube_search_demo 失败: {e}")
+    YOUTUBE_SEARCH_AVAILABLE = False
+
 MAX_CACHED_SONGS = 40
 
 def cleanup_old_downloads(max_count: int = MAX_CACHED_SONGS):
@@ -186,7 +193,22 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # 1. 预热/预缓冲接口 (供 MCP 调用)
+        # 0. 网页搜索 API: /api/search?q=<query>&maxResults=<num>
+        if path == "/api/search":
+            self.handle_search(parsed)
+            return
+
+        # 1. 本地已缓存歌曲及静态曲库 API: /api/cached
+        if path == "/api/cached":
+            self.handle_cached(parsed)
+            return
+
+        # 2. 删除缓存歌曲 API: /api/delete?v=<videoId>
+        if path == "/api/delete":
+            self.handle_delete(parsed)
+            return
+
+        # 3. 预热/预缓冲接口 (供 MCP 调用)
         if path == "/api/prepare":
             qs = urllib.parse.parse_qs(parsed.query)
             video_id = qs.get("v", [""])[0].strip()
@@ -211,21 +233,122 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             })
             return
 
-        # 2. 音频推流接口: /stream/<video_id>.mp3
+        # 4. 音频推流接口: /stream/<video_id>.mp3
         if path.startswith("/stream/") or path == "/stream":
             self.handle_youtube_stream(parsed)
             return
 
-        # 3. 静态文件处理 (如本地 /qingtian.ogg, /daoxiang.mp3 等)
+        # 5. 静态文件处理 (如本地 /qingtian.ogg, /daoxiang.mp3 等)
         super().do_GET()
 
-    def _send_json(self, data: dict):
-        body = json.dumps(data).encode("utf-8")
-        self.send_response(200)
+    def _send_json(self, data: dict, status: int = 200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_search(self, parsed):
+        qs = urllib.parse.parse_qs(parsed.query)
+        query = qs.get("q", [""])[0].strip()
+        max_results_str = qs.get("maxResults", ["10"])[0].strip()
+        max_results = int(max_results_str) if max_results_str.isdigit() else 10
+        if not query:
+            self._send_json({"ok": False, "error": "请输入搜索关键词"}, status=400)
+            return
+        
+        if not YOUTUBE_SEARCH_AVAILABLE:
+            self._send_json({"ok": False, "error": "YouTube 搜索模块不可用"}, status=503)
+            return
+
+        api_key = load_api_key()
+        if not api_key:
+            self._send_json({"ok": False, "error": "未配置 YOUTUBE_API_KEY"}, status=500)
+            return
+
+        try:
+            items = search_videos(query, api_key, max_results=max_results)
+            results = []
+            for item in items:
+                v_id = item.get("id", {}).get("videoId", "")
+                if not v_id:
+                    continue
+                snippet = item.get("snippet", {})
+                cached = (DOWNLOADS_DIR / f"{v_id}.mp3").exists()
+                thumbs = snippet.get("thumbnails", {})
+                thumb_url = thumbs.get("medium", {}).get("url") or thumbs.get("default", {}).get("url") or f"https://i.ytimg.com/vi/{v_id}/mqdefault.jpg"
+                results.append({
+                    "videoId": v_id,
+                    "title": snippet.get("title", ""),
+                    "channel": snippet.get("channelTitle", ""),
+                    "publishedAt": snippet.get("publishedAt", ""),
+                    "duration": item.get("duration", "未知"),
+                    "thumbnail": thumb_url,
+                    "cached": cached,
+                    "stream_url": f"/stream/{v_id}.mp3"
+                })
+            self._send_json({"ok": True, "items": results, "total": len(results)})
+        except Exception as e:
+            self._send_json({"ok": False, "error": f"搜索异常: {e}"}, status=500)
+
+    def handle_cached(self, parsed):
+        try:
+            cached_list = []
+            for p in sorted(DOWNLOADS_DIR.glob("*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True):
+                stat = p.stat()
+                cached_list.append({
+                    "videoId": p.stem,
+                    "fileName": p.name,
+                    "sizeMb": round(stat.st_size / (1024 * 1024), 2),
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                    "streamUrl": f"/stream/{p.name}"
+                })
+
+            static_list = []
+            for fname, title, artist in [
+                ("qingtian.mp3", "晴天", "周杰伦"),
+                ("daoxiang.mp3", "稻香", "周杰伦"),
+                ("xiaoyanzi.mp3", "小燕子", "童谣")
+            ]:
+                fpath = ROOT_DIR / fname
+                if fpath.exists():
+                    stat = fpath.stat()
+                    static_list.append({
+                        "fileName": fname,
+                        "title": title,
+                        "artist": artist,
+                        "sizeMb": round(stat.st_size / (1024 * 1024), 2),
+                        "streamUrl": f"/{fname}"
+                    })
+
+            self._send_json({
+                "ok": True,
+                "cached": cached_list,
+                "static": static_list,
+                "totalCached": len(cached_list),
+                "maxCached": MAX_CACHED_SONGS
+            })
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)}, status=500)
+
+    def handle_delete(self, parsed):
+        qs = urllib.parse.parse_qs(parsed.query)
+        v_id = qs.get("v", [""])[0].strip()
+        if not v_id:
+            self._send_json({"ok": False, "error": "缺少 videoId"}, status=400)
+            return
+        target = DOWNLOADS_DIR / f"{v_id}.mp3"
+        if target.exists():
+            try:
+                target.unlink()
+                self._send_json({"ok": True, "message": f"已删除 {v_id}.mp3"})
+                return
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, status=500)
+                return
+        self._send_json({"ok": False, "error": "文件不存在"}, status=404)
 
     def handle_youtube_stream(self, parsed):
         video_id = None
