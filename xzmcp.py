@@ -79,20 +79,54 @@ def make_music_result(song_name: str, artist: str, audio_url: str) -> dict:
         "message": f"已找到歌曲《{song_name}》- {artist}"
     }
 
+ROOT_DIR = Path(__file__).resolve().parent
+
+def notify_log(event_type: str, msg: str):
+    """尝试将事件发送到流媒体日志缓冲区"""
+    try:
+        url = f"http://127.0.0.1:{SERVER_PORT}/api/log_event?type={urllib.parse.quote(event_type)}&msg={urllib.parse.quote(msg)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "XiaozhiMCP/1.0"})
+        with urllib.request.urlopen(req, timeout=1):
+            pass
+    except Exception:
+        pass
+
+def clean_song_query(query: str) -> str:
+    cleaned = query.strip()
+    for prefix in ["我想听", "我要听", "帮我放", "请播放", "播放一首", "播放", "放一首", "来一首", "唱一首", "搜索", "点歌", "点一首", "给我放", "给我唱"]:
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+            break
+    for suffix in ["的歌", "的歌曲", "这首歌", "这首歌曲", "这歌", "一首"]:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[:-len(suffix)].strip()
+            break
+    return cleaned if cleaned else query.strip()
+
 def search_youtube_and_stream(query: str) -> dict:
     """搜索 YouTube 并请求本地流服务器预缓冲几秒，然后返回小智播放链接"""
     if not YOUTUBE_ENABLED:
+        notify_log("ERROR", f"YouTube 模块未启用 (搜索: {query})")
         return {"status": "error", "message": "YouTube 模块未启用"}
 
     api_key = load_api_key()
     if not api_key:
         print("[YouTube Error] 未找到 YOUTUBE_API_KEY", file=sys.stderr, flush=True)
+        notify_log("ERROR", "未配置 YOUTUBE_API_KEY")
         return {"status": "error", "message": "未配置 YouTube API Key"}
 
-    print(f"[YouTube 搜索] 正在检索: '{query}'", file=sys.stderr, flush=True)
+    cleaned_q = clean_song_query(query)
+    print(f"[YouTube 搜索] 原始: '{query}' -> 清洗: '{cleaned_q}'", file=sys.stderr, flush=True)
+    notify_log("SEARCH", f"检索: '{query}'" + (f" (清洗词: '{cleaned_q}')" if cleaned_q != query else ""))
+
     try:
-        items = search_videos(query, api_key, max_results=1)
+        items = search_videos(cleaned_q, api_key, max_results=1)
+        if not items and cleaned_q != query:
+            print(f"[YouTube 搜索] 清洗词未搜到，回退原始词重试: '{query}'", file=sys.stderr, flush=True)
+            items = search_videos(query, api_key, max_results=1)
+
         if not items:
+            notify_log("NOT_FOUND", f"未找到: '{query}'")
             return {"status": "not_found", "message": f"在 YouTube 上未搜索到《{query}》"}
         
         item = items[0]
@@ -102,6 +136,7 @@ def search_youtube_and_stream(query: str) -> dict:
         channel = snippet.get("channelTitle", "YouTube")
 
         print(f"[YouTube 命中] 《{title}》 ID: {video_id}，正在通知流服务器预缓冲...", file=sys.stderr, flush=True)
+        notify_log("HIT", f"命中《{title}》({channel}) ID: {video_id}")
 
         # 触发本地流服务器预缓冲 (等待几秒首包缓冲完成)
         try:
@@ -109,7 +144,7 @@ def search_youtube_and_stream(query: str) -> dict:
                 f"http://127.0.0.1:{SERVER_PORT}/api/prepare?v={video_id}",
                 headers={"User-Agent": "XiaozhiMCP/1.0"}
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 print(f"[YouTube 预缓冲响应] {data}", file=sys.stderr, flush=True)
         except Exception as e:
@@ -119,6 +154,7 @@ def search_youtube_and_stream(query: str) -> dict:
         return make_music_result(title, channel, stream_url)
     except Exception as e:
         print(f"[YouTube 搜索异常] {e}", file=sys.stderr, flush=True)
+        notify_log("ERROR", f"搜索异常: {e}")
         return {"status": "error", "message": f"YouTube 搜索异常: {e}"}
 
 # --- 功能 1：根据歌名点歌播放（优先私有曲库，若无则无缝搜索 YouTube 边下边播） ---
@@ -129,11 +165,20 @@ def play_my_music(song_name: str) -> str:
     :param song_name: 歌曲名称或关键词，例如：晴天、稻香、七里香、Taylor Swift
     """
     print(f"\n[DEBUG 收到点歌请求] 查找歌名: '{song_name}'", file=sys.stderr, flush=True)
-    # 1. 优先在本地私有曲库中查找
+    notify_log("MCP_CALL", f"收到点歌: '{song_name}'")
+
+    # 1. 优先在本地私有曲库中查找（必须同时确认本地文件实际存在）
+    cleaned_name = clean_song_query(song_name)
     for name, info in MUSIC_LIBRARY.items():
-        if song_name.lower() in name.lower() or name.lower() in song_name.lower():
-            print(f"[DEBUG 命中私有曲库] 《{name}》- {info['artist']} -> {info['url']}\n", file=sys.stderr, flush=True)
-            return json.dumps(make_music_result(name, info["artist"], info["url"]), ensure_ascii=False)
+        if name.lower() in song_name.lower() or name.lower() in cleaned_name.lower():
+            fname = Path(info["url"]).name
+            fpath = ROOT_DIR / fname
+            if fpath.exists():
+                print(f"[DEBUG 命中私有曲库] 《{name}》- {info['artist']} -> {info['url']}\n", file=sys.stderr, flush=True)
+                notify_log("LOCAL_HIT", f"命中本地曲库: 《{name}》({info['artist']})")
+                return json.dumps(make_music_result(name, info["artist"], info["url"]), ensure_ascii=False)
+            else:
+                print(f"[DEBUG 忽略私有曲库条目] 《{name}》本地文件 {fname} 缺失，自动转入全网检索！", file=sys.stderr, flush=True)
 
     # 2. 本地曲库未命中，自动无缝检索 YouTube 进行实时流式点播 (方案 A)
     print(f"[DEBUG 私有曲库未命中] 自动启动全网 YouTube 检索与实时流式缓冲: '{song_name}'\n", file=sys.stderr, flush=True)

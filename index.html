@@ -532,6 +532,7 @@
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('search')">🔍 全网音乐搜索</button>
       <button class="tab-btn" onclick="switchTab('cached')">📂 本地已缓存曲库 (<span id="cacheCountBadge">0</span>/40)</button>
+      <button class="tab-btn" onclick="switchTab('logs')">📋 小智实时日志与调试</button>
     </div>
 
     <!-- 搜索页面 -->
@@ -586,6 +587,33 @@
         <div class="empty-card">正在加载缓存曲库...</div>
       </div>
     </div>
+
+    <!-- 实时调试日志页面 -->
+    <div id="logsTab" style="display: none;">
+      <div class="search-box-card" style="margin-bottom: 20px;">
+        <h3 style="font-size: 16px; margin-bottom: 10px; color: var(--primary);">💡 小智点歌排障与失败根因指引</h3>
+        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6; margin-bottom: 8px;">
+          1. <b>大模型未调用工具</b>：有时小智口播“我为你播放...”，但下方日志中没有出现 <code style="color:var(--primary)">MCP_CALL</code>，说明大模型只生成了文字回复而没有触发工具调用。可以在小智控制台的角色 Prompt 人设中强调强制调用工具。
+        </p>
+        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6; margin-bottom: 8px;">
+          2. <b>语音词带有杂质</b>：若小智听成“给我唱一首七里香”，系统现已内置常见口语词清洗，自动剥离杂音后检索 YouTube。
+        </p>
+        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.6;">
+          3. <b>音箱拉流状态</b>：当看到 <code style="color:var(--success)">STREAM (设备 IP 请求推流)</code> 时，说明小智已成功连入服务器开始播放。
+        </p>
+      </div>
+
+      <div class="section-title">
+        <span>小智与云端实时事件流 (自动每 2.5 秒刷新)</span>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-sm btn-outline" id="logAutoToggle" onclick="toggleLogAuto()">⏸️ 暂停自动刷新</button>
+          <button class="btn btn-sm btn-outline" onclick="loadLogs()">🔄 立即刷新</button>
+        </div>
+      </div>
+      <div id="logsContainer" style="display: flex; flex-direction: column; gap: 10px;">
+        <div class="empty-card">正在加载实时日志...</div>
+      </div>
+    </div>
   </main>
 
   <!-- 底部固定播放器 -->
@@ -606,6 +634,8 @@
 
   <script>
     const API_BASE = window.location.origin;
+    let logTimer = null;
+    let logAuto = true;
 
     function showToast(msg) {
       const t = document.getElementById("toast");
@@ -614,17 +644,73 @@
       setTimeout(() => { t.style.display = "none"; }, 3000);
     }
 
+    function toggleLogAuto() {
+      logAuto = !logAuto;
+      document.getElementById("logAutoToggle").innerText = logAuto ? "⏸️ 暂停自动刷新" : "▶️ 开启自动刷新";
+      if (logAuto) loadLogs();
+    }
+
     function switchTab(tab) {
       document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+      if (logTimer) { clearInterval(logTimer); logTimer = null; }
+
       if (tab === 'search') {
         document.querySelectorAll(".tab-btn")[0].classList.add("active");
         document.getElementById("searchTab").style.display = "block";
         document.getElementById("cachedTab").style.display = "none";
-      } else {
+        document.getElementById("logsTab").style.display = "none";
+      } else if (tab === 'cached') {
         document.querySelectorAll(".tab-btn")[1].classList.add("active");
         document.getElementById("searchTab").style.display = "none";
         document.getElementById("cachedTab").style.display = "block";
+        document.getElementById("logsTab").style.display = "none";
         loadCachedList();
+      } else if (tab === 'logs') {
+        document.querySelectorAll(".tab-btn")[2].classList.add("active");
+        document.getElementById("searchTab").style.display = "none";
+        document.getElementById("cachedTab").style.display = "none";
+        document.getElementById("logsTab").style.display = "block";
+        loadLogs();
+        logTimer = setInterval(() => {
+          if (logAuto) loadLogs();
+        }, 2500);
+      }
+    }
+
+    async function loadLogs() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/logs`);
+        const data = await resp.json();
+        const container = document.getElementById("logsContainer");
+        if (!data.ok || !data.logs || data.logs.length === 0) {
+          container.innerHTML = `<div class="empty-card">暂无实时日志事件。对着小智说一句点歌指令后将在此实时捕捉。</div>`;
+          return;
+        }
+
+        container.innerHTML = data.logs.map(log => {
+          let badgeClass = 'tag-stream';
+          let icon = 'ℹ️';
+          if (log.type === 'MCP_CALL') { badgeClass = 'tag-cached'; icon = '🗣️'; }
+          else if (log.type === 'SEARCH') { badgeClass = 'tag-stream'; icon = '🔍'; }
+          else if (log.type === 'LOCAL_HIT') { badgeClass = 'tag-cached'; icon = '⭐'; }
+          else if (log.type === 'HIT') { badgeClass = 'tag-cached'; icon = '🎯'; }
+          else if (log.type === 'PREPARE') { badgeClass = 'tag-cached'; icon = '⚡'; }
+          else if (log.type === 'STREAM') { badgeClass = 'tag-cached'; icon = '🎧'; }
+          else if (log.type === 'ERROR' || log.type === 'NOT_FOUND') { badgeClass = 'tag-stream'; icon = '❌'; }
+
+          return `
+            <div style="background:var(--card-bg); border:1px solid var(--border); border-radius:8px; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+              <div style="display:flex; align-items:center; gap:10px;">
+                <span style="font-family:monospace; font-size:12px; color:var(--text-muted);">${log.time}</span>
+                <span class="card-cache-tag ${badgeClass}" style="position:static; padding:2px 8px;">${icon} ${log.type}</span>
+                <span style="font-size:14px; font-weight:600; color:var(--text);">${log.message}</span>
+              </div>
+              ${log.detail ? `<span style="font-size:12px; color:var(--text-muted);">${log.detail}</span>` : ''}
+            </div>
+          `;
+        }).join("");
+      } catch (err) {
+        console.error(err);
       }
     }
 

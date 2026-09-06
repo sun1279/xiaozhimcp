@@ -22,6 +22,21 @@ except Exception as e:
 
 MAX_CACHED_SONGS = 40
 
+LOG_BUFFER = []
+LOG_LOCK = threading.Lock()
+
+def add_log(event_type: str, message: str, detail: str = ""):
+    with LOG_LOCK:
+        entry = {
+            "time": time.strftime("%H:%M:%S", time.localtime()),
+            "type": event_type,
+            "message": message,
+            "detail": detail
+        }
+        LOG_BUFFER.append(entry)
+        if len(LOG_BUFFER) > 60:
+            LOG_BUFFER.pop(0)
+
 def cleanup_old_downloads(max_count: int = MAX_CACHED_SONGS):
     """当下载的音乐超过 max_count 首时，删除最早下载的文件，最多保留 max_count 首"""
     try:
@@ -193,22 +208,38 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # 0. 网页搜索 API: /api/search?q=<query>&maxResults=<num>
+        # 0. 实时日志接口: /api/logs
+        if path == "/api/logs":
+            with LOG_LOCK:
+                logs_copy = list(reversed(LOG_BUFFER))
+            self._send_json({"ok": True, "logs": logs_copy})
+            return
+
+        # 0.1 外部日志事件上报接口: /api/log_event
+        if path == "/api/log_event":
+            qs = urllib.parse.parse_qs(parsed.query)
+            t = qs.get("type", ["INFO"])[0]
+            m = qs.get("msg", [""])[0]
+            add_log(t, m)
+            self._send_json({"ok": True})
+            return
+
+        # 1. 网页搜索 API: /api/search?q=<query>&maxResults=<num>
         if path == "/api/search":
             self.handle_search(parsed)
             return
 
-        # 1. 本地已缓存歌曲及静态曲库 API: /api/cached
+        # 2. 本地已缓存歌曲及静态曲库 API: /api/cached
         if path == "/api/cached":
             self.handle_cached(parsed)
             return
 
-        # 2. 删除缓存歌曲 API: /api/delete?v=<videoId>
+        # 3. 删除缓存歌曲 API: /api/delete?v=<videoId>
         if path == "/api/delete":
             self.handle_delete(parsed)
             return
 
-        # 3. 预热/预缓冲接口 (供 MCP 调用)
+        # 4. 预热/预缓冲接口 (供 MCP 调用)
         if path == "/api/prepare":
             qs = urllib.parse.parse_qs(parsed.query)
             video_id = qs.get("v", [""])[0].strip()
@@ -218,22 +249,24 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             
             cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
             if cache_file.exists():
+                add_log("PREPARE", f"预热命中本地缓存: {video_id}", "已存在完整文件")
                 self._send_json({"ok": True, "cached": True, "videoId": video_id})
                 return
 
             session = stream_manager.get_or_create(video_id)
-            # 等待几秒预缓冲
-            ready = session.wait_for_buffer(min_bytes=65536, timeout=6.0) if session else True
+            # 等待 2.5 秒快速预缓冲约 32KB
+            ready = session.wait_for_buffer(min_bytes=32768, timeout=2.5) if session else True
+            add_log("PREPARE", f"预热推流管道: {video_id}", f"buffered: {session.total_bytes if session else 0} B, ready={ready}")
             self._send_json({
                 "ok": True,
                 "cached": False,
                 "videoId": video_id,
-                "buffered_bytes": session.total_bytes if session else cache_file.stat().st_size,
+                "buffered_bytes": session.total_bytes if session else (cache_file.stat().st_size if cache_file.exists() else 0),
                 "ready": ready
             })
             return
 
-        # 4. 音频推流接口: /stream/<video_id>.mp3
+        # 5. 音频推流接口: /stream/<video_id>.mp3
         if path.startswith("/stream/") or path == "/stream":
             self.handle_youtube_stream(parsed)
             return
@@ -365,9 +398,12 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             self.send_error(400, "Missing videoId")
             return
 
+        client_ip = self.client_address[0] if self.client_address else "未知"
         cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
         # A. 命中本地缓存，直接以静态文件高效发送
         if cache_file.exists():
+            size_mb = round(cache_file.stat().st_size / 1048576, 2)
+            add_log("STREAM", f"设备 {client_ip} 播放缓存: {video_id}.mp3", f"{size_mb} MB (本地秒开)")
             print(f"[HTTP] 命中本地完整缓存，秒级发送: {cache_file.name}")
             self.send_response(200)
             self.send_header("Content-Type", "audio/mpeg")
@@ -379,6 +415,7 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             return
 
         # B. 动态分块推流 (Transfer-Encoding: chunked)
+        add_log("STREAM", f"设备 {client_ip} 请求推流: {video_id}.mp3", "HTTP 1.1 Chunked 边下边推")
         print(f"[HTTP] 建立分块流式连接 (Chunked): {video_id}")
         session = stream_manager.get_or_create(video_id)
         if session:
