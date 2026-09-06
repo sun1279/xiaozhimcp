@@ -13,6 +13,35 @@ ROOT_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = ROOT_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
+MAX_CACHED_SONGS = 40
+
+def cleanup_old_downloads(max_count: int = MAX_CACHED_SONGS):
+    """当下载的音乐超过 max_count 首时，删除最早下载的文件，最多保留 max_count 首"""
+    try:
+        mp3_files = [p for p in DOWNLOADS_DIR.glob("*.mp3") if p.is_file()]
+        if len(mp3_files) > max_count:
+            # 按照修改时间从小到大排序（最旧的排在最前）
+            mp3_files.sort(key=lambda p: p.stat().st_mtime)
+            remove_count = len(mp3_files) - max_count
+            for p in mp3_files[:remove_count]:
+                try:
+                    p.unlink(missing_ok=True)
+                    print(f"[Cache Cleanup] 缓存歌曲超过 {max_count} 首，已自动清理最早下载的文件: {p.name}")
+                except Exception as err:
+                    print(f"[Cache Cleanup Error] 无法删除文件 {p.name}: {err}")
+    except Exception as e:
+        print(f"[Cache Cleanup Error] 检查清理缓存失败: {e}")
+
+def cleanup_stale_temp_files(max_age_seconds: int = 3600):
+    """清理异常中断残留的临时 .tmp 文件"""
+    try:
+        now = time.time()
+        for tmp_p in DOWNLOADS_DIR.glob("*.tmp"):
+            if tmp_p.is_file() and (now - tmp_p.stat().st_mtime) > max_age_seconds:
+                tmp_p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 def find_ffmpeg() -> str:
     f = shutil.which("ffmpeg")
     if f:
@@ -92,6 +121,7 @@ class StreamSession:
                     os.remove(self.cache_file)
                 os.rename(self.tmp_file, self.cache_file)
                 print(f"[Stream] 成功缓存整首歌曲: {self.cache_file.name} ({self.total_bytes} 字节)")
+                cleanup_old_downloads(MAX_CACHED_SONGS)
 
         except Exception as e:
             self.error = str(e)
@@ -272,6 +302,8 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             print(f"[HTTP Stream Error] {e}")
 
 def run_server(host="0.0.0.0", port=8111):
+    cleanup_stale_temp_files()
+    cleanup_old_downloads(MAX_CACHED_SONGS)
     server = ThreadingHTTPServer((host, port), MusicStreamHandler)
     print(f"=====================================================")
     print(f"[MusicStreamServer] 运行中: http://{host}:{port}")
