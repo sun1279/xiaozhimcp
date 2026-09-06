@@ -2,6 +2,7 @@
 新建文本文档.txt
 *.txt
 .env
+.env*
 *.token
 
 # Python 运行时与编辑临时文件

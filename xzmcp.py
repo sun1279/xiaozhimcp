@@ -1,4 +1,4 @@
-﻿import warnings
+import warnings
 warnings.filterwarnings("ignore", message=".*IncompleteFieldDefinitionWarning.*")
 warnings.filterwarnings("ignore", message=".*lifespan.*")
 import os
@@ -12,7 +12,7 @@ from fastmcp import FastMCP
 
 # 导入 YouTube API 模块
 YOUTUBE_API_DIR = r"E:\proj\youtubeApi"
-if YOUTUBE_API_DIR not in sys.path:
+if os.path.exists(YOUTUBE_API_DIR) and YOUTUBE_API_DIR not in sys.path:
     sys.path.append(YOUTUBE_API_DIR)
 
 try:
@@ -25,33 +25,35 @@ except Exception as e:
 # 1. 初始化 MCP 服务
 mcp = FastMCP("XiaozhiPrivateMusicServer")
 
-LOCAL_IP = "192.168.50.220"
-SERVER_PORT = 8111
+LOCAL_IP = os.environ.get("LOCAL_IP", "192.168.50.220")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8111"))
+# 支持统一前缀（如 http://music.sunjw.cn），默认使用本地局域网 IP 与端口
+BASE_URL = os.environ.get("BASE_URL", f"http://{LOCAL_IP}:{SERVER_PORT}").rstrip("/")
 
 # 2. 私有曲库数据。URL 必须能被 ESP32 直接访问并返回 MP3 数据。
 MUSIC_LIBRARY = {
     "晴天": {
-        "url": f"http://{LOCAL_IP}:{SERVER_PORT}/qingtian.mp3",
+        "url": f"{BASE_URL}/qingtian.mp3",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "稻香": {
-        "url": f"http://{LOCAL_IP}:{SERVER_PORT}/daoxiang.mp3",
+        "url": f"{BASE_URL}/daoxiang.mp3",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "小燕子": {
-        "url": f"http://{LOCAL_IP}:{SERVER_PORT}/xiaoyanzi.mp3",
+        "url": f"{BASE_URL}/xiaoyanzi.mp3",
         "artist": "未知",
         "genre": "未知"
     },
     "夜曲": {
-        "url": f"http://{LOCAL_IP}:{SERVER_PORT}/yequ.mp3",
+        "url": f"{BASE_URL}/yequ.mp3",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "海阔天空": {
-        "url": f"http://{LOCAL_IP}:{SERVER_PORT}/haikuotiankong.mp3",
+        "url": f"{BASE_URL}/haikuotiankong.mp3",
         "artist": "Beyond",
         "genre": "摇滚"
     }
@@ -113,7 +115,7 @@ def search_youtube_and_stream(query: str) -> dict:
         except Exception as e:
             print(f"[YouTube 预缓冲请求异常] {e} (客户端直接请求时会自动触发流式缓冲)", file=sys.stderr, flush=True)
 
-        stream_url = f"http://{LOCAL_IP}:{SERVER_PORT}/stream/{video_id}.mp3"
+        stream_url = f"{BASE_URL}/stream/{video_id}.mp3"
         return make_music_result(title, channel, stream_url)
     except Exception as e:
         print(f"[YouTube 搜索异常] {e}", file=sys.stderr, flush=True)
