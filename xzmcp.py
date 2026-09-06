@@ -157,15 +157,158 @@ def search_youtube_and_stream(query: str) -> dict:
         notify_log("ERROR", f"搜索异常: {e}")
         return {"status": "error", "message": f"YouTube 搜索异常: {e}"}
 
-# --- 功能 1：根据歌名点歌播放（优先私有曲库，若无则无缝搜索 YouTube 边下边播） ---
+LAST_SEARCH_OPTIONS = []
+
+def parse_choice_index(text: str) -> int | None:
+    """尝试从自然语言文本解析用户选择的序号（0-indexed）"""
+    t = text.strip()
+    patterns = [
+        (0, ["1", "一", "第一", "首个", "1号"]),
+        (1, ["2", "二", "两", "第二", "2号"]),
+        (2, ["3", "三", "第三", "3号"]),
+        (3, ["4", "四", "第四", "4号"]),
+        (4, ["5", "五", "第五", "5号"]),
+    ]
+    # 优先匹配“第X”、“选X”、“听X”、“放X”、“来X”
+    for idx, keywords in patterns:
+        for kw in keywords:
+            for verb in ["第", "选", "听", "放", "来", "要"]:
+                if f"{verb}{kw}" in t:
+                    return idx
+    # 精确或短文本包含
+    for idx, keywords in patterns:
+        for kw in keywords:
+            if t == kw or (kw in t and len(t) <= 6):
+                return idx
+    return None
+
+# --- 功能 1：搜索歌曲候选列表（提供多个结果让用户语音选择） ---
+@mcp.tool()
+def search_music_options(query: str, count: int = 3) -> str:
+    """
+    【搜索歌曲/候选版本挑选】当用户要求“搜索歌曲”、“找找某某的歌”、“搜一下xxx”、“有哪些版本”、“查一下某歌”或泛指歌手名时调用。
+    返回 3 个候选歌曲版本，由大模型用语音念给用户听并等待用户语音回答挑选第几个。
+    :param query: 想要搜索的歌曲关键词、歌名或歌手名
+    :param count: 候选数量，默认 3 首 (1~5)
+    """
+    global LAST_SEARCH_OPTIONS
+    print(f"\n[DEBUG 搜索歌曲候选] query: '{query}', count={count}", file=sys.stderr, flush=True)
+    notify_log("SEARCH", f"候选检索: '{query}'")
+
+    if not YOUTUBE_ENABLED:
+        notify_log("ERROR", "YouTube 模块未启用")
+        return json.dumps({"status": "error", "message": "YouTube 搜索模块未启用"}, ensure_ascii=False)
+
+    api_key = load_api_key()
+    if not api_key:
+        notify_log("ERROR", "未配置 YOUTUBE_API_KEY")
+        return json.dumps({"status": "error", "message": "未配置 YouTube API Key"}, ensure_ascii=False)
+
+    cleaned_q = clean_song_query(query)
+    num = max(1, min(int(count), 5))
+    try:
+        items = search_videos(cleaned_q, api_key, max_results=num)
+        if not items and cleaned_q != query:
+            items = search_videos(query, api_key, max_results=num)
+
+        if not items:
+            notify_log("NOT_FOUND", f"未找到候选: '{query}'")
+            return json.dumps({"status": "not_found", "message": f"在 YouTube 上未找到与《{query}》相关的歌曲"}, ensure_ascii=False)
+
+        options = []
+        for idx, item in enumerate(items):
+            vid = item.get("id", {}).get("videoId", "")
+            snip = item.get("snippet", {})
+            title = snip.get("title", f"选项 {idx+1}")
+            channel = snip.get("channelTitle", "")
+            options.append({
+                "index": idx + 1,
+                "title": title,
+                "channel": channel,
+                "video_id": vid
+            })
+
+        LAST_SEARCH_OPTIONS = options
+        notify_log("HIT", f"找到 {len(options)} 首候选 (首选: {options[0]['title'][:18]})")
+
+        return json.dumps({
+            "status": "multiple_results",
+            "query": query,
+            "total": len(options),
+            "options": options,
+            "instruction": (
+                "【重要指令】请用亲切简短的中文口语向用户朗读找到的这些选项（例如：'为您找到了几个版本：第一个是xxx，第二个是xxx，请问您想听第几个？'）。"
+                "【禁止】此时切勿调用设备播放工具 self.audio.play_url，必须等待用户回答序号（如“第1个”、“放第二个”）或选定具体版本后，"
+                "再调用 play_selected_song 工具（传入对应选项的 video_id）来进行播放。"
+            )
+        }, ensure_ascii=False)
+    except Exception as e:
+        print(f"[YouTube 候选搜索异常] {e}", file=sys.stderr, flush=True)
+        notify_log("ERROR", f"候选搜索异常: {e}")
+        return json.dumps({"status": "error", "message": f"搜索异常: {e}"}, ensure_ascii=False)
+
+# --- 功能 2：播放用户选中的歌曲 ---
+@mcp.tool()
+def play_selected_song(video_id_or_index: str, title: str = "") -> str:
+    """
+    【播放用户选中的歌曲】当用户从之前 search_music_options 列出的候选中选定了某首歌（例如用户回答说“第1个”、“放第二个”、“听现场版”等）时调用。
+    :param video_id_or_index: 选中的序号（如 '1', '2' 或 '第1个'）或者对应的 YouTube 视频 ID (如 'nDchQNPuA0k')
+    :param title: 歌曲标题（可选）
+    """
+    global LAST_SEARCH_OPTIONS
+    print(f"\n[DEBUG 播放选中歌曲] target: '{video_id_or_index}', title: '{title}'", file=sys.stderr, flush=True)
+
+    target = str(video_id_or_index).strip()
+    video_id = target
+    choice_idx = parse_choice_index(target)
+
+    # 1. 序号索引解析
+    if choice_idx is not None and LAST_SEARCH_OPTIONS and 0 <= choice_idx < len(LAST_SEARCH_OPTIONS):
+        sel = LAST_SEARCH_OPTIONS[choice_idx]
+        video_id = sel["video_id"]
+        title = title or sel["title"]
+    elif len(video_id) != 11 and LAST_SEARCH_OPTIONS:
+        # 2. 如果不是11位ID，尝试按标题关键字模糊匹配
+        for opt in LAST_SEARCH_OPTIONS:
+            if target.lower() in opt["title"].lower() or (title and title.lower() in opt["title"].lower()):
+                video_id = opt["video_id"]
+                title = opt["title"]
+                break
+
+    notify_log("HIT", f"选中播放: {title or video_id} (ID: {video_id})")
+
+    # 预缓冲
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{SERVER_PORT}/api/prepare?v={video_id}",
+            headers={"User-Agent": "XiaozhiMCP/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            print(f"[YouTube 预缓冲响应] {data}", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[YouTube 预缓冲请求异常] {e}", file=sys.stderr, flush=True)
+
+    stream_url = f"{BASE_URL}/stream/{video_id}.mp3"
+    return json.dumps(make_music_result(title or f"YouTube 音乐", "YouTube", stream_url), ensure_ascii=False)
+
+# --- 功能 3：直接点歌播放（无需选择，优先本地曲库，其次秒播 YouTube 第一条） ---
 @mcp.tool()
 def play_my_music(song_name: str) -> str:
     """
-    【指定点歌】当用户明确指定歌名想要听某首歌时调用。支持私有曲库及全网 YouTube 歌曲点歌。
-    :param song_name: 歌曲名称或关键词，例如：晴天、稻香、七里香、Taylor Swift
+    【直接点歌播放】当用户明确指定歌名想要直接立刻听歌时调用（例如：“播放晴天”、“放一首稻香”、“来一首七里香”）。直接播放最匹配的一首。
+    :param song_name: 歌曲名称或关键词
     """
+    global LAST_SEARCH_OPTIONS
     print(f"\n[DEBUG 收到点歌请求] 查找歌名: '{song_name}'", file=sys.stderr, flush=True)
     notify_log("MCP_CALL", f"收到点歌: '{song_name}'")
+
+    # 兼容容错：如果用户在上一轮多选后回答“第1个”，而模型误调了 play_my_music
+    choice_idx = parse_choice_index(song_name)
+    if choice_idx is not None and LAST_SEARCH_OPTIONS and 0 <= choice_idx < len(LAST_SEARCH_OPTIONS):
+        sel = LAST_SEARCH_OPTIONS[choice_idx]
+        print(f"[DEBUG 自动重定向] 识别到序号选择: {song_name} -> 播放候选《{sel['title']}》\n", file=sys.stderr, flush=True)
+        return play_selected_song(sel["video_id"], sel["title"])
 
     # 1. 优先在本地私有曲库中查找（必须同时确认本地文件实际存在）
     cleaned_name = clean_song_query(song_name)
@@ -185,11 +328,11 @@ def play_my_music(song_name: str) -> str:
     res = search_youtube_and_stream(song_name)
     return json.dumps(res, ensure_ascii=False)
 
-# --- 功能 2：专用的 YouTube 点歌工具 ---
+# --- 功能 4：专用的 YouTube 直接点播工具 ---
 @mcp.tool()
 def search_and_play_youtube(song_name: str) -> str:
     """
-    【YouTube 点歌】专门用于在 YouTube 上搜索音乐并实时流式推送给小智播放。
+    【YouTube 直接点歌】专门用于在 YouTube 上搜索音乐并直接秒播第一首。
     :param song_name: 想要搜索并播放的 YouTube 歌曲名或艺术家
     """
     print(f"\n[DEBUG 收到 YouTube 点歌] '{song_name}'", file=sys.stderr, flush=True)
