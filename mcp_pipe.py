@@ -33,52 +33,86 @@ async def bridge():
         print("[ERROR] 请指定要拉起的 MCP 脚本，例如: python mcp_pipe.py python .\\xzmcp.py")
         sys.exit(1)
 
-    print(f"[mcp-pipe] 正在拉起本地 MCP 服务: {' '.join(cmd)}")
-    
-    # 拉起本地 MCP 子进程
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=sys.stderr
-    )
+    while True:
+        print(f"[mcp-pipe] 正在拉起本地 MCP 服务: {' '.join(cmd)}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=sys.stderr
+        )
 
-    print(f"[mcp-pipe] 正在连接小智 WSS 接入点: {endpoint[:35]}...")
-    try:
-        async with websockets.connect(endpoint) as ws:
-            print("[SUCCESS] [mcp-pipe] WSS 连接成功！MCP 工具已注册到小智云端。")
+        print(f"[mcp-pipe] 正在连接小智 WSS 接入点: {endpoint[:35]}...")
+        try:
+            async with websockets.connect(
+                endpoint,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=10
+            ) as ws:
+                print("[SUCCESS] [mcp-pipe] WSS 连接成功！MCP 工具已注册到小智云端。", flush=True)
 
-            # 云端 WSS 命令 -> 发送给本地 MCP 进程的 Stdin
-            async def ws_to_stdin():
+                # 云端 WSS 命令 -> 发送给本地 MCP 进程的 Stdin
+                async def ws_to_stdin():
+                    try:
+                        async for message in ws:
+                            if process.stdin:
+                                data = message.encode('utf-8') if isinstance(message, str) else message
+                                process.stdin.write(data + b'\n')
+                                await process.stdin.drain()
+
+                            # 记录云端发来的 RPC 命令
+                            try:
+                                import json
+                                msg_str = message if isinstance(message, str) else message.decode('utf-8', errors='ignore')
+                                msg_obj = json.loads(msg_str)
+                                method = msg_obj.get("method")
+                                if method == "tools/call":
+                                    params = msg_obj.get("params", {})
+                                    print(f"[mcp-pipe 收到云端工具调用] 工具: {params.get('name')}, 参数: {params.get('arguments')}", flush=True)
+                                elif method:
+                                    print(f"[mcp-pipe 收到云端 RPC] 方法: {method}", flush=True)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(f"[mcp-pipe] WS -> Stdin 异常: {e}", flush=True)
+
+                # 本地 MCP 进程输出 Stdout -> 发送给云端 WSS
+                async def stdout_to_ws():
+                    try:
+                        while True:
+                            line = await process.stdout.readline()
+                            if not line:
+                                break
+                            msg = line.decode('utf-8', errors='replace').strip()
+                            if msg:
+                                await ws.send(msg)
+                                try:
+                                    import json
+                                    resp_obj = json.loads(msg)
+                                    if "result" in resp_obj:
+                                        print(f"[mcp-pipe 返回云端响应] ID: {resp_obj.get('id')} 成功返回", flush=True)
+                                    elif "error" in resp_obj:
+                                        print(f"[mcp-pipe 返回云端错误] ID: {resp_obj.get('id')} 错误: {resp_obj.get('error')}", flush=True)
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        print(f"[mcp-pipe] Stdout -> WS 异常: {e}", flush=True)
+
+                await asyncio.gather(ws_to_stdin(), stdout_to_ws())
+
+        except Exception as e:
+            print(f"[ERROR] [mcp-pipe] 连接异常: {e}", flush=True)
+        finally:
+            if process.returncode is None:
                 try:
-                    async for message in ws:
-                        if process.stdin:
-                            data = message.encode('utf-8') if isinstance(message, str) else message
-                            process.stdin.write(data + b'\n')
-                            await process.stdin.drain()
-                except Exception as e:
-                    print(f"[mcp-pipe] WS -> Stdin 异常: {e}")
+                    process.terminate()
+                    await process.wait()
+                except Exception:
+                    pass
 
-            # 本地 MCP 进程输出 Stdout -> 发送给云端 WSS
-            async def stdout_to_ws():
-                try:
-                    while True:
-                        line = await process.stdout.readline()
-                        if not line:
-                            break
-                        msg = line.decode('utf-8').strip()
-                        if msg:
-                            await ws.send(msg)
-                except Exception as e:
-                    print(f"[mcp-pipe] Stdout -> WS 异常: {e}")
-
-            await asyncio.gather(ws_to_stdin(), stdout_to_ws())
-
-    except Exception as e:
-        print(f"[ERROR] [mcp-pipe] 连接小智 WSS 端点失败: {e}")
-    finally:
-        if process.returncode is None:
-            process.terminate()
+        print("[mcp-pipe] 3 秒后尝试重新连接...", flush=True)
+        await asyncio.sleep(3)
 
 if __name__ == "__main__":
     if sys.platform == 'win32' and sys.version_info < (3, 16):
