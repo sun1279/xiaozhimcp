@@ -61,30 +61,12 @@ MUSIC_LIBRARY = {
     }
 }
 
-def make_music_result(song_name: str, artist: str, audio_url: str) -> dict:
-    """Return a URL for the model to pass to the device playback tool."""
-    print(
-        f"[DEBUG 返回歌曲结果] song='{song_name}' url='{audio_url}'; "
-        "等待云端调用 self.audio.play_url",
-        file=sys.stderr,
-        flush=True,
-    )
-    return {
-        "status": "success",
-        "song_name": song_name,
-        "artist": artist,
-        "audio_url": audio_url,
-        "instruction": (
-            "请立即调用设备工具 self.audio.play_url，"
-            "arguments.url 使用 audio_url 的值；不要发送 type=notify。"
-        ),
-        "message": f"已找到歌曲《{song_name}》- {artist}"
-    }
-
 ROOT_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = ROOT_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 METADATA_FILE = DOWNLOADS_DIR / "metadata.json"
+CURRENT_PLAYING_FILE = DOWNLOADS_DIR / "current_playing.json"
+CURRENT_PLAYING_INFO = None
 
 def load_metadata() -> dict:
     if METADATA_FILE.exists():
@@ -108,6 +90,70 @@ def save_metadata(video_id: str, title: str, channel: str = ""):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[Metadata Error] {e}", file=sys.stderr, flush=True)
+
+def get_current_playing_record() -> dict:
+    global CURRENT_PLAYING_INFO
+    if CURRENT_PLAYING_INFO:
+        return CURRENT_PLAYING_INFO
+    if CURRENT_PLAYING_FILE.exists():
+        try:
+            with open(CURRENT_PLAYING_FILE, "r", encoding="utf-8") as f:
+                CURRENT_PLAYING_INFO = json.load(f)
+                if CURRENT_PLAYING_INFO:
+                    return CURRENT_PLAYING_INFO
+        except Exception:
+            pass
+    meta = load_metadata()
+    if meta:
+        try:
+            latest_id = max(meta.keys(), key=lambda k: meta[k].get("timestamp", 0))
+            item = meta[latest_id]
+            return {
+                "song_name": item.get("title", "未知歌曲"),
+                "artist": item.get("channel", "未知歌手"),
+                "audio_url": f"{BASE_URL}/stream/{latest_id}.mp3",
+                "time": item.get("time", ""),
+                "timestamp": item.get("timestamp", 0)
+            }
+        except Exception:
+            pass
+    return None
+
+def set_current_playing_record(song_name: str, artist: str, audio_url: str):
+    global CURRENT_PLAYING_INFO
+    CURRENT_PLAYING_INFO = {
+        "song_name": song_name,
+        "artist": artist,
+        "audio_url": audio_url,
+        "time": time.strftime("%H:%M:%S", time.localtime()),
+        "timestamp": time.time()
+    }
+    try:
+        with open(CURRENT_PLAYING_FILE, "w", encoding="utf-8") as f:
+            json.dump(CURRENT_PLAYING_INFO, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Current Playing Error] {e}", file=sys.stderr, flush=True)
+
+def make_music_result(song_name: str, artist: str, audio_url: str) -> dict:
+    """Return a URL for the model to pass to the device playback tool."""
+    set_current_playing_record(song_name, artist, audio_url)
+    print(
+        f"[DEBUG 返回歌曲结果] song='{song_name}' url='{audio_url}'; "
+        "等待云端调用 self.audio.play_url",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {
+        "status": "success",
+        "song_name": song_name,
+        "artist": artist,
+        "audio_url": audio_url,
+        "instruction": (
+            "请立即调用设备工具 self.audio.play_url，"
+            "arguments.url 使用 audio_url 的值；不要发送 type=notify。"
+        ),
+        "message": f"已找到歌曲《{song_name}》- {artist}"
+    }
 
 def notify_log(event_type: str, msg: str):
     """尝试将事件发送到流媒体日志缓冲区"""
@@ -419,6 +465,17 @@ def play_my_music(song_name: str) -> str:
     """
     global LAST_SEARCH_OPTIONS
     print(f"\n[DEBUG 收到点歌请求] 查找歌名: '{song_name}'", file=sys.stderr, flush=True)
+    # 兼容容错 0.01：如果用户询问“你在播什么”/“这是什么歌”/“刚才放的什么”
+    if any(q in song_name for q in ["在播什么", "播什么歌", "放的什么歌", "现在放的是什么", "这是什么歌", "这是哪首歌", "这是啥歌", "现在播什么", "刚才放的什么", "刚刚放的是什么", "歌名是什么", "这是什么音乐", "刚才那首歌", "唱的什么"]):
+        print(f"[DEBUG 自动重定向] 识别到查询歌曲指令: '{song_name}' -> 触发 get_now_playing()\n", file=sys.stderr, flush=True)
+        return get_now_playing()
+
+    # 兼容容错 0.02：如果用户说“继续播放”/“接着放”/“恢复播放”
+    cleaned_strip = song_name.strip()
+    if cleaned_strip in ["继续", "接着", "继续播放", "接着放", "继续放", "恢复播放", "接着听", "继续听", "接着播"] or any(q in song_name for q in ["继续播放", "接着放", "继续放", "恢复播放", "接着听", "继续听", "接着播"]):
+        print(f"[DEBUG 自动重定向] 识别到续播指令: '{song_name}' -> 触发 resume_music()\n", file=sys.stderr, flush=True)
+        return resume_music()
+
     # 兼容容错 0：如果包含定时关闭指令（如“30分钟后停止”、“半小时后关音乐”）
     if any(k in song_name for k in ["定时", "分钟后", "小时后", "半小时", "分钟停止"]):
         import re
@@ -434,8 +491,8 @@ def play_my_music(song_name: str) -> str:
     if any(phrase in song_name for phrase in ["取消定时", "取消睡眠", "不要定时"]):
         return cancel_sleep_timer()
 
-    # 兼容容错 0.2：如果用户说“停止播放”/“别放了”/“关掉音乐”
-    if any(phrase in song_name for phrase in ["停止", "别放了", "关掉音乐", "不放了", "别唱了", "不要放歌"]):
+    # 兼容容错 0.2：如果用户说“停止播放”/“别放了”/“关掉音乐”/“暂停播放”
+    if any(phrase in song_name for phrase in ["停止", "别放了", "关掉音乐", "不放了", "别唱了", "不要放歌", "暂停"]):
         print(f"[DEBUG 自动重定向] 识别到停止指令: '{song_name}' -> 触发 stop_music()\n", file=sys.stderr, flush=True)
         return stop_music()
 
@@ -702,11 +759,11 @@ def get_sleep_timer_status() -> str:
         "message": "当前没有设置睡眠定时哦。"
     }, ensure_ascii=False)
 
-# --- 功能 10：立即停止播放音乐 ---
+# --- 功能 10：立即停止/暂停播放音乐 ---
 @mcp.tool()
 def stop_music() -> str:
     """
-    【立即停止播放音乐】当用户明确说“停止播放”、“别放了”、“关掉音乐”、“暂停播放”、“不要放歌了”时调用。
+    【立即停止/暂停播放音乐】当用户明确说“停止播放”、“别放了”、“关掉音乐”、“暂停播放”、“不要放歌了”时调用。
     """
     print("[DEBUG 立即停止播放]", file=sys.stderr, flush=True)
     notify_log("STOP", "立即停止音乐播放")
@@ -719,8 +776,64 @@ def stop_music() -> str:
 
     return json.dumps({
         "status": "success",
-        "message": "已为你停止播放音乐。"
+        "message": "已为你停止播放音乐。如需继续收听，可随时对我说“继续播放”。"
     }, ensure_ascii=False)
+
+# --- 功能 11：查询当前/刚刚播放的歌曲 ---
+@mcp.tool()
+def get_now_playing() -> str:
+    """
+    【查询当前正在播放/刚刚播放的歌曲】当用户询问“你在播什么”、“现在播的是什么歌”、“这是什么歌”、“刚才放的是什么”、“正在播放什么”、“刚才那首歌叫什么”等问题时调用。
+    """
+    rec = get_current_playing_record()
+    if not rec or not rec.get("song_name"):
+        notify_log("NOW_PLAYING", "查询当前播放：暂无记录")
+        return json.dumps({
+            "status": "idle",
+            "message": "当前没有正在播放的歌曲，也没有刚才播放的记录。你可以随时告诉我你想听什么歌。"
+        }, ensure_ascii=False)
+
+    song = rec["song_name"]
+    artist = rec.get("artist", "")
+    t = rec.get("time", "")
+    info_msg = f"当前（或刚才播放）的歌曲是《{song}》"
+    if artist:
+        info_msg += f" - {artist}"
+    if t:
+        info_msg += f"（于 {t} 开始播放）"
+    info_msg += "。如果你刚才打断了我，可以说“继续播放”来继续收听。"
+
+    notify_log("NOW_PLAYING", f"查询当前播放 -> 《{song}》- {artist}")
+    return json.dumps({
+        "status": "playing_or_paused",
+        "song_name": song,
+        "artist": artist,
+        "play_time": t,
+        "message": info_msg
+    }, ensure_ascii=False)
+
+# --- 功能 12：继续播放/恢复播放 ---
+@mcp.tool()
+def resume_music() -> str:
+    """
+    【继续播放/恢复播放】当用户在被打断或暂停后想要继续听歌，说“继续播放”、“接着放”、“恢复播放”、“继续听”、“继续”时调用。
+    """
+    rec = get_current_playing_record()
+    if not rec or not rec.get("audio_url"):
+        notify_log("RESUME", "恢复播放失败：无上一首记录")
+        return json.dumps({
+            "status": "error",
+            "message": "没有找到刚才播放的歌曲记录，请直接告诉我你想听什么歌。"
+        }, ensure_ascii=False)
+
+    song = rec["song_name"]
+    artist = rec.get("artist", "")
+    url = rec["audio_url"]
+    notify_log("RESUME", f"恢复播放 -> 《{song}》- {artist}")
+
+    res = make_music_result(song, artist, url)
+    res["message"] = f"继续为你播放《{song}》" + (f" - {artist}" if artist else "")
+    return json.dumps(res, ensure_ascii=False)
 
 if __name__ == "__main__":
     mcp.run()

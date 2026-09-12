@@ -698,6 +698,8 @@
           else if (log.type === 'STREAM') { badgeClass = 'tag-cached'; icon = '🎧'; }
           else if (log.type === 'TIMER') { badgeClass = 'tag-cached'; icon = '⏰'; }
           else if (log.type === 'STOP') { badgeClass = 'tag-stream'; icon = '⏹️'; }
+          else if (log.type === 'NOW_PLAYING') { badgeClass = 'tag-cached'; icon = '🎵'; }
+          else if (log.type === 'RESUME') { badgeClass = 'tag-cached'; icon = '▶️'; }
           else if (log.type === 'ERROR' || log.type === 'NOT_FOUND') { badgeClass = 'tag-stream'; icon = '❌'; }
 
           return `

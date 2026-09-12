@@ -186,9 +186,15 @@ music/
 | | `cleanup_old_downloads` | 扫描 `downloads/` 目录，超出 40 首时依据时间戳删除最旧文件 |
 | | `MusicStreamHandler` | 处理 `/api/prepare`、`/stream/<id>.mp3` 及常规静态文件路由 |
 | **`xzmcp.py`** | `play_my_music` | 主入口工具：优先私有曲库，未命中自动转入 YouTube 搜索推流 |
-| | `search_and_play_youtube` | 专用全网点歌工具：专用于检索并播放 YouTube 音频 |
-| | `list_music_library` | 查询歌单工具：列出当前本地收录的歌曲 |
-| | `play_random_music` | 随机点歌工具：在本地精选曲库中随机抽选 |
+| | `search_music_options` | 交互式多选点歌：返回候选曲目列表并朗读给用户挑选 |
+| | `next_music_options` | 候选歌单换一批：无缝加载并朗读下一批候选版本 |
+| | `play_selected_song` | 执行序号选歌：根据用户的语音序号秒播目标曲目 |
+| | `get_now_playing` | 查询播放信息：回答用户“你在播什么”、“这是什么歌”等提问 |
+| | `resume_music` | 继续/恢复播放：在打断或暂停后，根据上一首记录继续播放 |
+| | `stop_music` | 立即停止播放：切断流媒体传输使音箱停止放音 |
+| | `set_sleep_timer` | 定时停止播放：倒计时自动停止推流 |
+| | `list_music_library` | 查询歌单工具：列出最近播放与缓存历史 |
+| | `play_random_music` | 随机点歌工具：在精选或历史缓存中随机播放 |
 | **`mcp_pipe.py`** | `run_pipe` | 维持与 `wss://api.xiaozhi.me/mcp/?token=...` 的长连接，双向映射 stdio |
 
 ---
@@ -243,8 +249,10 @@ pip install fastmcp websockets yt-dlp google-api-python-client
 > 3. **换一批**：当用户说‘换一批’、‘下一批’、‘还有其他版本吗’时，调用 `next_music_options` 切换后续的 5 个版本朗读给用户；
 > 4. **确认选歌**：当用户回答‘第1个’、‘放第二个’、‘听第三首’等选择时，调用 `play_selected_song` 传入序号或 video_id；
 > 5. **执行播放**：收到任何返回 audio_url 的成功结果后，严格根据 instruction 指令立即调用设备工具 `self.audio.play_url` 播放音乐，不要回复 type=notify；
-> 6. **停止播放**：当用户说‘停止播放’、‘别放了’、‘关掉音乐’时，调用 `stop_music`；
-> 7. **睡眠定时**：当用户说‘xx分钟后停止播放’、‘半小时后睡觉’时，提取分钟数调用 `set_sleep_timer`；当询问剩余时间或取消时调用 `get_sleep_timer_status` 或 `cancel_sleep_timer`。”**
+> 6. **停止播放**：当用户说‘停止播放’、‘别放了’、‘关掉音乐’、‘暂停播放’时，调用 `stop_music`；
+> 7. **睡眠定时**：当用户说‘xx分钟后停止播放’、‘半小时后睡觉’时，提取分钟数调用 `set_sleep_timer`；当询问剩余时间或取消时调用 `get_sleep_timer_status` 或 `cancel_sleep_timer`；
+> 8. **查询当前播放**：当用户询问‘你在播什么’、‘现在放的是什么歌’、‘这是什么歌’、‘刚才放的是什么’时，调用 `get_now_playing` 获取当前/最近播放的歌曲信息；
+> 9. **继续播放**：当用户在打断或暂停后说‘继续播放’、‘接着放’、‘恢复播放’、‘继续听’时，调用 `resume_music` 恢复播放刚才的歌曲。”**
 
 ### 第 5 步：一键运行服务
 双击运行目录下的批处理脚本：
