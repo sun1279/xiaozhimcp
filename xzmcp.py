@@ -35,27 +35,27 @@ BASE_URL = os.environ.get("BASE_URL", f"http://{LOCAL_IP}:{SERVER_PORT}").rstrip
 # 2. 私有曲库数据。URL 必须能被 ESP32 直接访问并返回 MP3 数据。
 MUSIC_LIBRARY = {
     "晴天": {
-        "url": f"{BASE_URL}/qingtian.mp3",
+        "url": f"{BASE_URL}/stream/qingtian.mp3",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "稻香": {
-        "url": f"{BASE_URL}/daoxiang.mp3",
+        "url": f"{BASE_URL}/stream/daoxiang.mp3",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "小燕子": {
-        "url": f"{BASE_URL}/xiaoyanzi.mp3",
+        "url": f"{BASE_URL}/stream/xiaoyanzi.mp3",
         "artist": "未知",
         "genre": "未知"
     },
     "夜曲": {
-        "url": f"{BASE_URL}/yequ.mp3",
+        "url": f"{BASE_URL}/stream/yequ.mp3",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "海阔天空": {
-        "url": f"{BASE_URL}/haikuotiankong.mp3",
+        "url": f"{BASE_URL}/stream/haikuotiankong.mp3",
         "artist": "Beyond",
         "genre": "摇滚"
     }

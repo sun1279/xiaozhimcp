@@ -488,35 +488,70 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
 
         client_ip = self.client_address[0] if self.client_address else "未知"
         cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
+        if not cache_file.exists():
+            for cand in [ROOT_DIR / f"{video_id}.mp3", ROOT_DIR / f"{video_id}.ogg", DOWNLOADS_DIR / f"{video_id}.ogg"]:
+                if cand.exists():
+                    cache_file = cand
+                    break
+
         register_stream(self)
         self.is_stopped = False
 
-        # A. 命中本地缓存，直接以分块方式发送（可被定时随时切断）
+        # A. 命中本地缓存，以实时播放速率匀速分块推流 (支持随时精准切断)
         if cache_file.exists():
             size_mb = round(cache_file.stat().st_size / 1048576, 2)
-            add_log("STREAM", f"设备 {client_ip} 播放缓存: {video_id}.mp3", f"{size_mb} MB (本地秒开)")
-            print(f"[HTTP] 命中本地完整缓存，秒级发送: {cache_file.name}")
+            add_log("STREAM", f"设备 {client_ip} 播放缓存: {cache_file.name}", f"{size_mb} MB (实时流控推流)")
+            print(f"[HTTP] 命中本地完整缓存，开始匀速推流: {cache_file.name}")
+            self.protocol_version = "HTTP/1.1"
             self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
-            self.send_header("Content-Length", str(cache_file.stat().st_size))
-            self.send_header("Accept-Ranges", "bytes")
+            content_type = "audio/ogg" if cache_file.suffix.lower() == ".ogg" else "audio/mpeg"
+            self.send_header("Content-Type", content_type)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+
+            start_time = time.time()
+            bytes_sent = 0
+            INITIAL_BURST = 96 * 1024  # 96 KB 快速起播缓冲 (~6秒音频)
+            TARGET_RATE = 16500  # ~132 kbps 略高于 128k，确保音箱绝对不饥饿
+
             try:
                 with open(cache_file, "rb") as f:
                     while not getattr(self, 'is_stopped', False):
-                        buf = f.read(32768)
+                        buf = f.read(16384)
                         if not buf:
                             break
-                        self.wfile.write(buf)
+                        chunk_hdr = f"{len(buf):X}\r\n".encode("ascii")
+                        self.wfile.write(chunk_hdr + buf + b"\r\n")
                         self.wfile.flush()
+
+                        bytes_sent += len(buf)
+                        if bytes_sent > INITIAL_BURST:
+                            expected_time = (bytes_sent - INITIAL_BURST) / TARGET_RATE
+                            elapsed = time.time() - start_time
+                            sleep_time = expected_time - elapsed
+                            if sleep_time > 0:
+                                end_sleep = time.time() + sleep_time
+                                while time.time() < end_sleep:
+                                    if getattr(self, 'is_stopped', False):
+                                        break
+                                    time.sleep(min(0.05, end_sleep - time.time()))
+
+                if not getattr(self, 'is_stopped', False):
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                print(f"[HTTP] 本地音频推流完成: {cache_file.name}")
             except (BrokenPipeError, ConnectionResetError):
                 print(f"[HTTP] 客户端断开连接: {cache_file.name}")
+            except Exception as e:
+                print(f"[HTTP Stream Error] {e}")
             finally:
                 unregister_stream(self)
             return
 
-        # B. 动态分块推流 (Transfer-Encoding: chunked)
-        add_log("STREAM", f"设备 {client_ip} 请求推流: {video_id}.mp3", "HTTP 1.1 Chunked 边下边推")
+        # B. 动态分块推流 (Transfer-Encoding: chunked + 实时流控)
+        add_log("STREAM", f"设备 {client_ip} 请求推流: {video_id}.mp3", "HTTP 1.1 Chunked 实时流控")
         print(f"[HTTP] 建立分块流式连接 (Chunked): {video_id}")
         session = stream_manager.get_or_create(video_id)
         if session:
@@ -528,7 +563,13 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "audio/mpeg")
         self.send_header("Transfer-Encoding", "chunked")
         self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+
+        start_time = time.time()
+        bytes_sent = 0
+        INITIAL_BURST = 96 * 1024  # 96 KB 快速起播缓冲
+        TARGET_RATE = 16500  # ~132 kbps
 
         idx = 0
         try:
@@ -552,6 +593,18 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
                     chunk_hdr = f"{len(chunk):X}\r\n".encode("ascii")
                     self.wfile.write(chunk_hdr + chunk + b"\r\n")
                     self.wfile.flush()
+
+                    bytes_sent += len(chunk)
+                    if bytes_sent > INITIAL_BURST:
+                        expected_time = (bytes_sent - INITIAL_BURST) / TARGET_RATE
+                        elapsed = time.time() - start_time
+                        sleep_time = expected_time - elapsed
+                        if sleep_time > 0:
+                            end_sleep = time.time() + sleep_time
+                            while time.time() < end_sleep:
+                                if getattr(self, 'is_stopped', False):
+                                    break
+                                time.sleep(min(0.05, end_sleep - time.time()))
 
             # 发送 chunked 终止块
             if not getattr(self, 'is_stopped', False):
