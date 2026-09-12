@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import socket
 import shutil
 import threading
 import subprocess
@@ -24,6 +25,41 @@ MAX_CACHED_SONGS = 40
 
 LOG_BUFFER = []
 LOG_LOCK = threading.Lock()
+
+ACTIVE_STREAMS = set()
+STREAMS_LOCK = threading.Lock()
+
+def register_stream(handler):
+    with STREAMS_LOCK:
+        ACTIVE_STREAMS.add(handler)
+
+def unregister_stream(handler):
+    with STREAMS_LOCK:
+        ACTIVE_STREAMS.discard(handler)
+
+def stop_all_active_streams() -> int:
+    with STREAMS_LOCK:
+        count = len(ACTIVE_STREAMS)
+        for h in list(ACTIVE_STREAMS):
+            try:
+                setattr(h, 'is_stopped', True)
+                try:
+                    h.wfile.write(b"0\r\n\r\n")
+                    h.wfile.flush()
+                except Exception:
+                    pass
+                try:
+                    h.connection.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    h.connection.close()
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[Stop Stream Error] {e}")
+        ACTIVE_STREAMS.clear()
+        return count
 
 def add_log(event_type: str, message: str, detail: str = ""):
     with LOG_LOCK:
@@ -307,12 +343,19 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             })
             return
 
+        # 4.5 停止当前音频推流接口: /api/stop_stream
+        if path == "/api/stop_stream":
+            stopped_cnt = stop_all_active_streams()
+            add_log("STREAM", "触发停止播放", f"已切断 {stopped_cnt} 个音频推流连接")
+            self._send_json({"ok": True, "stopped_count": stopped_cnt, "message": f"已成功停止当前音频推流 (切断 {stopped_cnt} 个连接)"})
+            return
+
         # 5. 音频推流接口: /stream/<video_id>.mp3
         if path.startswith("/stream/") or path == "/stream":
             self.handle_youtube_stream(parsed)
             return
 
-        # 5. 静态文件处理 (如本地 /qingtian.ogg, /daoxiang.mp3 等)
+        # 6. 静态文件处理 (如本地 /qingtian.ogg, /daoxiang.mp3 等)
         super().do_GET()
 
     def _send_json(self, data: dict, status: int = 200):
@@ -445,7 +488,10 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
 
         client_ip = self.client_address[0] if self.client_address else "未知"
         cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
-        # A. 命中本地缓存，直接以静态文件高效发送
+        register_stream(self)
+        self.is_stopped = False
+
+        # A. 命中本地缓存，直接以分块方式发送（可被定时随时切断）
         if cache_file.exists():
             size_mb = round(cache_file.stat().st_size / 1048576, 2)
             add_log("STREAM", f"设备 {client_ip} 播放缓存: {video_id}.mp3", f"{size_mb} MB (本地秒开)")
@@ -455,8 +501,18 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(cache_file.stat().st_size))
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
-            with open(cache_file, "rb") as f:
-                shutil.copyfileobj(f, self.wfile)
+            try:
+                with open(cache_file, "rb") as f:
+                    while not getattr(self, 'is_stopped', False):
+                        buf = f.read(32768)
+                        if not buf:
+                            break
+                        self.wfile.write(buf)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                print(f"[HTTP] 客户端断开连接: {cache_file.name}")
+            finally:
+                unregister_stream(self)
             return
 
         # B. 动态分块推流 (Transfer-Encoding: chunked)
@@ -476,7 +532,7 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
 
         idx = 0
         try:
-            while session:
+            while session and not getattr(self, 'is_stopped', False):
                 chunk = None
                 with session.lock:
                     if idx < len(session.chunks):
@@ -492,19 +548,22 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
                         elif session.done:
                             break
 
-                if chunk:
+                if chunk and not getattr(self, 'is_stopped', False):
                     chunk_hdr = f"{len(chunk):X}\r\n".encode("ascii")
                     self.wfile.write(chunk_hdr + chunk + b"\r\n")
                     self.wfile.flush()
 
             # 发送 chunked 终止块
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            if not getattr(self, 'is_stopped', False):
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
             print(f"[HTTP] 分块推流完成: {video_id}")
         except (BrokenPipeError, ConnectionResetError):
             print(f"[HTTP] 客户端断开连接: {video_id}")
         except Exception as e:
             print(f"[HTTP Stream Error] {e}")
+        finally:
+            unregister_stream(self)
 
 def run_server(host="0.0.0.0", port=8111):
     cleanup_stale_temp_files()

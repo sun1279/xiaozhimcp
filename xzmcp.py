@@ -4,7 +4,9 @@ warnings.filterwarnings("ignore", message=".*lifespan.*")
 import os
 import sys
 import json
+import time
 import random
+import threading
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -417,7 +419,25 @@ def play_my_music(song_name: str) -> str:
     """
     global LAST_SEARCH_OPTIONS
     print(f"\n[DEBUG 收到点歌请求] 查找歌名: '{song_name}'", file=sys.stderr, flush=True)
-    notify_log("MCP_CALL", f"收到点歌: '{song_name}'")
+    # 兼容容错 0：如果包含定时关闭指令（如“30分钟后停止”、“半小时后关音乐”）
+    if any(k in song_name for k in ["定时", "分钟后", "小时后", "半小时", "分钟停止"]):
+        import re
+        m = re.search(r'(\d+)\s*(?:分钟|分)', song_name)
+        if m:
+            return set_sleep_timer(int(m.group(1)))
+        if "半小时" in song_name:
+            return set_sleep_timer(30)
+        if "一小时" in song_name or "1小时" in song_name:
+            return set_sleep_timer(60)
+
+    # 兼容容错 0.1：如果用户说“取消定时”
+    if any(phrase in song_name for phrase in ["取消定时", "取消睡眠", "不要定时"]):
+        return cancel_sleep_timer()
+
+    # 兼容容错 0.2：如果用户说“停止播放”/“别放了”/“关掉音乐”
+    if any(phrase in song_name for phrase in ["停止", "别放了", "关掉音乐", "不放了", "别唱了", "不要放歌"]):
+        print(f"[DEBUG 自动重定向] 识别到停止指令: '{song_name}' -> 触发 stop_music()\n", file=sys.stderr, flush=True)
+        return stop_music()
 
     # 兼容容错 1：如果用户说“换一批”，而模型误调了 play_my_music
     if any(phrase in song_name for phrase in ["换一批", "下一批", "换一组", "下一页", "更多版本", "其他版本", "还有吗", "还有别的吗"]):
@@ -588,6 +608,119 @@ def play_random_music() -> str:
     print(f"[DEBUG 随机抽取] 抽中《{chosen['title']}》 -> {chosen['url']}\n", file=sys.stderr, flush=True)
     notify_log("HIT", f"随机抽中: {chosen['title']}")
     return json.dumps(make_music_result(chosen["title"], chosen["channel"], chosen["url"]), ensure_ascii=False)
+
+# --- 睡眠定时与播放控制状态 ---
+SLEEP_TIMER = None
+SLEEP_TIMER_END = 0.0
+SLEEP_TIMER_LOCK = threading.Lock()
+
+def _sleep_timer_trigger():
+    global SLEEP_TIMER, SLEEP_TIMER_END
+    print("[Sleep Timer] 睡眠定时倒计时到期，正在切断推流...", file=sys.stderr, flush=True)
+    notify_log("TIMER", "⏰ 睡眠定时到期，已自动停止音乐播放")
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{SERVER_PORT}/api/stop_stream")
+        with urllib.request.urlopen(req, timeout=3):
+            pass
+    except Exception as e:
+        print(f"[Sleep Timer Stop Error] {e}", file=sys.stderr, flush=True)
+    with SLEEP_TIMER_LOCK:
+        SLEEP_TIMER = None
+        SLEEP_TIMER_END = 0.0
+
+# --- 功能 7：设置定时停止播放（睡眠定时） ---
+@mcp.tool()
+def set_sleep_timer(minutes: int) -> str:
+    """
+    【设置定时停止播放/睡眠模式】当用户说“xx分钟后停止播放”、“半小时后关掉音乐”、“20分钟后睡觉”、“定时关闭音乐”时调用。
+    :param minutes: 倒计时分钟数，例如 15、20、30、60（“半小时”请传 30，“一小时”请传 60）
+    """
+    global SLEEP_TIMER, SLEEP_TIMER_END
+    mins = max(1, int(minutes))
+    seconds = mins * 60
+
+    with SLEEP_TIMER_LOCK:
+        if SLEEP_TIMER and SLEEP_TIMER.is_alive():
+            SLEEP_TIMER.cancel()
+        SLEEP_TIMER_END = time.time() + seconds
+        SLEEP_TIMER = threading.Timer(seconds, _sleep_timer_trigger)
+        SLEEP_TIMER.daemon = True
+        SLEEP_TIMER.start()
+
+    print(f"[DEBUG 设置睡眠定时] {mins} 分钟后自动停止播放", file=sys.stderr, flush=True)
+    notify_log("TIMER", f"设置定时关闭: {mins} 分钟后")
+    return json.dumps({
+        "status": "success",
+        "minutes": mins,
+        "message": f"好的，已为你设置在 {mins} 分钟后自动停止播放音乐，祝你好梦！"
+    }, ensure_ascii=False)
+
+# --- 功能 8：取消定时停止播放 ---
+@mcp.tool()
+def cancel_sleep_timer() -> str:
+    """
+    【取消定时关闭】当用户说“取消定时”、“取消睡眠模式”、“别关音乐了”、“取消定时关机”时调用。
+    """
+    global SLEEP_TIMER, SLEEP_TIMER_END
+    with SLEEP_TIMER_LOCK:
+        if SLEEP_TIMER and SLEEP_TIMER.is_alive():
+            SLEEP_TIMER.cancel()
+            SLEEP_TIMER = None
+            SLEEP_TIMER_END = 0.0
+            print("[DEBUG 取消睡眠定时] 已成功取消", file=sys.stderr, flush=True)
+            notify_log("TIMER", "已取消定时关闭")
+            return json.dumps({
+                "status": "success",
+                "message": "已为你取消睡眠定时，音乐将继续播放。"
+            }, ensure_ascii=False)
+
+    return json.dumps({
+        "status": "not_active",
+        "message": "当前没有正在运行的睡眠定时任务。"
+    }, ensure_ascii=False)
+
+# --- 功能 9：查询定时剩余时间 ---
+@mcp.tool()
+def get_sleep_timer_status() -> str:
+    """
+    【查询定时剩余时间】当用户问“还有多久关音乐”、“定时还剩几分钟”、“什么时候停止播放”时调用。
+    """
+    global SLEEP_TIMER, SLEEP_TIMER_END
+    with SLEEP_TIMER_LOCK:
+        if SLEEP_TIMER and SLEEP_TIMER.is_alive() and SLEEP_TIMER_END > time.time():
+            remaining_secs = int(SLEEP_TIMER_END - time.time())
+            rem_mins = max(1, round(remaining_secs / 60))
+            return json.dumps({
+                "status": "active",
+                "remaining_minutes": rem_mins,
+                "remaining_seconds": remaining_secs,
+                "message": f"音乐将在大约 {rem_mins} 分钟后自动停止播放。"
+            }, ensure_ascii=False)
+
+    return json.dumps({
+        "status": "inactive",
+        "message": "当前没有设置睡眠定时哦。"
+    }, ensure_ascii=False)
+
+# --- 功能 10：立即停止播放音乐 ---
+@mcp.tool()
+def stop_music() -> str:
+    """
+    【立即停止播放音乐】当用户明确说“停止播放”、“别放了”、“关掉音乐”、“暂停播放”、“不要放歌了”时调用。
+    """
+    print("[DEBUG 立即停止播放]", file=sys.stderr, flush=True)
+    notify_log("STOP", "立即停止音乐播放")
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{SERVER_PORT}/api/stop_stream")
+        with urllib.request.urlopen(req, timeout=3):
+            pass
+    except Exception as e:
+        print(f"[Stop Music Request Error] {e}", file=sys.stderr, flush=True)
+
+    return json.dumps({
+        "status": "success",
+        "message": "已为你停止播放音乐。"
+    }, ensure_ascii=False)
 
 if __name__ == "__main__":
     mcp.run()

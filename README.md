@@ -242,7 +242,9 @@ pip install fastmcp websockets yt-dlp google-api-python-client
 > 2. **搜索挑选**：当用户说‘搜一下xxx’、‘找找某某的歌’、‘查一下有什么版本’或只说了歌手名时，调用 `search_music_options` 检索候选。收到后，用简短自然的口语告诉用户全网找到了很多版本，并朗读当前精选推荐的这 5 个版本，告诉用户如果都不喜欢可以说【换一批】。此时**切勿**调用播放工具，等待用户语音回答；
 > 3. **换一批**：当用户说‘换一批’、‘下一批’、‘还有其他版本吗’时，调用 `next_music_options` 切换后续的 5 个版本朗读给用户；
 > 4. **确认选歌**：当用户回答‘第1个’、‘放第二个’、‘听第三首’等选择时，调用 `play_selected_song` 传入序号或 video_id；
-> 5. **执行播放**：收到任何返回 audio_url 的成功结果后，严格根据 instruction 指令立即调用设备工具 `self.audio.play_url` 播放音乐，不要回复 type=notify。”**
+> 5. **执行播放**：收到任何返回 audio_url 的成功结果后，严格根据 instruction 指令立即调用设备工具 `self.audio.play_url` 播放音乐，不要回复 type=notify；
+> 6. **停止播放**：当用户说‘停止播放’、‘别放了’、‘关掉音乐’时，调用 `stop_music`；
+> 7. **睡眠定时**：当用户说‘xx分钟后停止播放’、‘半小时后睡觉’时，提取分钟数调用 `set_sleep_timer`；当询问剩余时间或取消时调用 `get_sleep_timer_status` 或 `cancel_sleep_timer`。”**
 
 ### 第 5 步：一键运行服务
 双击运行目录下的批处理脚本：
