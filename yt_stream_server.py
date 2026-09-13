@@ -140,18 +140,23 @@ class StreamSession:
             p1 = subprocess.Popen([
                 sys.executable, "-m", "yt_dlp",
                 "--extractor-args", "youtube:player_client=android",
+                "--socket-timeout", "30",
+                "--retries", "5",
                 "-f", "bestaudio/best",
                 "-o", "-",
                 url
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-            # p2: ffmpeg 实时转码为标准 MP3 (128kbps) 输出到 stdout
+            # p2: ffmpeg 实时转码为与小智硬件完全匹配的单声道 24kHz 64kbps MP3
+            # （极低片上 SRAM 负荷，零软件重采样，内存占用减半，播放时长翻倍）
             p2 = subprocess.Popen([
                 FFMPEG_EXE,
                 "-i", "pipe:0",
                 "-vn",
                 "-codec:a", "libmp3lame",
-                "-b:a", "128k",
+                "-ac", "1",
+                "-ar", "24000",
+                "-b:a", "64k",
                 "-f", "mp3",
                 "pipe:1"
             ], stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
