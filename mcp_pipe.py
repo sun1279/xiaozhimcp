@@ -8,6 +8,23 @@ if sys.stdout.encoding != 'utf-8':
 if sys.stderr.encoding != 'utf-8':
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
+
+async def stop_process(process):
+    """Stop the local MCP child without leaving orphaned processes behind."""
+    if process.returncode is not None:
+        return
+
+    try:
+        process.terminate()
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        print("[mcp-pipe] 本地 MCP 未及时退出，强制终止", flush=True)
+        process.kill()
+        await process.wait()
+    except ProcessLookupError:
+        pass
+
+
 async def bridge():
     endpoint = os.environ.get("MCP_ENDPOINT")
     if not endpoint:
@@ -34,16 +51,17 @@ async def bridge():
         sys.exit(1)
 
     while True:
-        print(f"[mcp-pipe] 正在拉起本地 MCP 服务: {' '.join(cmd)}")
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=sys.stderr
-        )
-
-        print(f"[mcp-pipe] 正在连接小智 WSS 接入点: {endpoint[:35]}...")
+        process = None
         try:
+            print(f"[mcp-pipe] 正在拉起本地 MCP 服务: {' '.join(cmd)}", flush=True)
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=sys.stderr
+            )
+
+            print(f"[mcp-pipe] 正在连接小智 WSS 接入点: {endpoint[:35]}...", flush=True)
             async with websockets.connect(
                 endpoint,
                 ping_interval=20,
@@ -52,7 +70,6 @@ async def bridge():
             ) as ws:
                 print("[SUCCESS] [mcp-pipe] WSS 连接成功！MCP 工具已注册到小智云端。", flush=True)
 
-                # 云端 WSS 命令 -> 发送给本地 MCP 进程的 Stdin
                 async def ws_to_stdin():
                     try:
                         async for message in ws:
@@ -61,7 +78,6 @@ async def bridge():
                                 process.stdin.write(data + b'\n')
                                 await process.stdin.drain()
 
-                            # 记录云端发来的 RPC 命令
                             try:
                                 import json
                                 msg_str = message if isinstance(message, str) else message.decode('utf-8', errors='ignore')
@@ -74,16 +90,20 @@ async def bridge():
                                     print(f"[mcp-pipe 收到云端 RPC] 方法: {method}", flush=True)
                             except Exception:
                                 pass
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
                         print(f"[mcp-pipe] WS -> Stdin 异常: {e}", flush=True)
+                    finally:
+                        print("[mcp-pipe] 云端 WSS 读任务结束", flush=True)
 
-                # 本地 MCP 进程输出 Stdout -> 发送给云端 WSS
                 async def stdout_to_ws():
                     try:
                         while True:
                             line = await process.stdout.readline()
                             if not line:
-                                break
+                                print("[mcp-pipe] 本地 MCP stdout 已关闭", flush=True)
+                                return
                             msg = line.decode('utf-8', errors='replace').strip()
                             if msg:
                                 await ws.send(msg)
@@ -96,23 +116,39 @@ async def bridge():
                                         print(f"[mcp-pipe 返回云端错误] ID: {resp_obj.get('id')} 错误: {resp_obj.get('error')}", flush=True)
                                 except Exception:
                                     pass
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
                         print(f"[mcp-pipe] Stdout -> WS 异常: {e}", flush=True)
+                    finally:
+                        print("[mcp-pipe] 本地 MCP 输出转发任务结束", flush=True)
 
-                await asyncio.gather(ws_to_stdin(), stdout_to_ws())
+                tasks = {
+                    asyncio.create_task(ws_to_stdin()),
+                    asyncio.create_task(stdout_to_ws()),
+                }
+                done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                await asyncio.gather(*done, return_exceptions=True)
+                print("[mcp-pipe] 桥接任务结束，将关闭本轮连接并重连", flush=True)
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[ERROR] [mcp-pipe] 连接异常: {e}", flush=True)
         finally:
-            if process.returncode is None:
-                try:
-                    process.terminate()
-                    await process.wait()
-                except Exception:
-                    pass
+            if process is not None:
+                await stop_process(process)
 
         print("[mcp-pipe] 3 秒后尝试重新连接...", flush=True)
         await asyncio.sleep(3)
+
 
 if __name__ == "__main__":
     if sys.platform == 'win32' and sys.version_info < (3, 16):
@@ -120,4 +156,4 @@ if __name__ == "__main__":
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         except Exception:
             pass
-    asyncio.run(bridge())
+    asyncio.run(bridge())

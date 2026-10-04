@@ -47,6 +47,8 @@ def search_videos(
     api_key: str,
     max_results: int = 5,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    relevance_language: str | None = None,
+    region_code: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search public YouTube videos and return the API's item objects."""
     if not query.strip():
@@ -54,16 +56,22 @@ def search_videos(
     if not 1 <= max_results <= 50:
         raise ValueError("max_results 必须介于 1 和 50 之间。")
 
+    params: dict[str, Any] = {
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "maxResults": max_results,
+        "order": "relevance",
+        "key": api_key,
+    }
+    if relevance_language:
+        params["relevanceLanguage"] = relevance_language
+    if region_code:
+        params["regionCode"] = region_code
+
     payload = _get_json(
         SEARCH_API_URL,
-        {
-            "part": "snippet",
-            "q": query,
-            "type": "video",
-            "maxResults": max_results,
-            "order": "relevance",
-            "key": api_key,
-        },
+        params,
         timeout,
     )
 

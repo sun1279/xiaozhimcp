@@ -119,7 +119,7 @@ def notify_log(event_type: str, msg: str):
 
 def clean_song_query(query: str) -> str:
     cleaned = query.strip()
-    for prefix in ["我想听", "我要听", "帮我放", "请播放", "播放一首", "播放", "放一首", "来一首", "唱一首", "搜索", "点歌", "点一首", "给我放", "给我唱"]:
+    for prefix in ["我想听", "我要听", "帮我搜索", "帮我找", "帮我放", "请搜索", "请播放", "搜索一下", "搜一下", "查找", "查一下", "找找", "请找", "播放一首", "放一首", "来一首", "唱一首", "点一首", "给我放", "给我唱", "搜索", "播放", "点歌", "找", "搜", "查"]:
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):].strip()
             break
@@ -128,6 +128,36 @@ def clean_song_query(query: str) -> str:
             cleaned = cleaned[:-len(suffix)].strip()
             break
     return cleaned if cleaned else query.strip()
+
+
+def detect_search_locale(query: str) -> tuple[str, str, str]:
+    """Return (mode, YouTube relevance language, region) from the user's intent."""
+    text = query.strip().lower()
+    english_markers = ("英文", "英语", "英語", "english", "欧美", "外国", "西洋")
+    chinese_markers = ("中文", "华语", "国语", "粤语", "國語", "粵語", "中文歌")
+
+    if any(marker in text for marker in english_markers):
+        return "en", "en", "US"
+    if any(marker in text for marker in chinese_markers):
+        return "zh", "zh-Hans", "CN"
+    return "auto", "", ""
+
+
+def prepare_search_query(query: str) -> tuple[str, str, str, str]:
+    """Clean the query and return query plus locale metadata for YouTube."""
+    cleaned = clean_song_query(query)
+    mode, relevance_language, region_code = detect_search_locale(query)
+    if mode == "en":
+        for marker in ("英文歌曲", "英文歌", "英语歌曲", "英语歌", "英文", "英语", "English songs", "english songs"):
+            cleaned = cleaned.replace(marker, " ").strip()
+        cleaned = cleaned.replace("适合学习", "for studying")
+        cleaned = cleaned.replace("学习歌曲", "songs for studying")
+        cleaned = cleaned.replace("歌曲", "songs")
+        if cleaned:
+            cleaned = f"{cleaned} English" if "songs" in cleaned else f"{cleaned} English songs"
+        else:
+            cleaned = "English songs"
+    return cleaned, mode, relevance_language, region_code
 
 def search_youtube_and_stream(query: str) -> dict:
     """搜索 YouTube 并请求本地流服务器预缓冲几秒，然后返回小智播放链接"""
@@ -141,15 +171,27 @@ def search_youtube_and_stream(query: str) -> dict:
         notify_log("ERROR", "未配置 YOUTUBE_API_KEY")
         return {"status": "error", "message": "未配置 YouTube API Key"}
 
-    cleaned_q = clean_song_query(query)
-    print(f"[YouTube 搜索] 原始: '{query}' -> 清洗: '{cleaned_q}'", file=sys.stderr, flush=True)
+    cleaned_q, search_mode, relevance_language, region_code = prepare_search_query(query)
+    print(f"[YouTube 搜索] 原始: '{query}' -> 清洗: '{cleaned_q}' 模式: {search_mode}", file=sys.stderr, flush=True)
     notify_log("SEARCH", f"检索: '{query}'" + (f" (清洗词: '{cleaned_q}')" if cleaned_q != query else ""))
 
     try:
-        items = search_videos(cleaned_q, api_key, max_results=1)
+        items = search_videos(
+            cleaned_q,
+            api_key,
+            max_results=1,
+            relevance_language=relevance_language or None,
+            region_code=region_code or None,
+        )
         if not items and cleaned_q != query:
             print(f"[YouTube 搜索] 清洗词未搜到，回退原始词重试: '{query}'", file=sys.stderr, flush=True)
-            items = search_videos(query, api_key, max_results=1)
+            items = search_videos(
+                query,
+                api_key,
+                max_results=1,
+                relevance_language=relevance_language or None,
+                region_code=region_code or None,
+            )
 
         if not items:
             notify_log("NOT_FOUND", f"未找到: '{query}'")
@@ -268,6 +310,7 @@ def search_music_options(query: str, count: int = 5) -> str:
     """
     【搜索歌曲/候选版本挑选】当用户要求“搜索歌曲”、“找找某某的歌”、“搜一下xxx”、“有哪些版本”、“查一下某歌”或泛指歌手名时调用。
     全网检索海量版本，默认精选推荐前 5 个版本念给用户听并等待用户挑选；用户也可说“换一批”。
+    如果用户明确要求英文歌、英语内容或 English songs，优先将 query 组织为英文检索词；如果用户要求中文内容，保持中文检索词。
     :param query: 想要搜索的歌曲关键词、歌名或歌手名
     :param count: 候选数量，默认 5 首
     """
@@ -284,12 +327,25 @@ def search_music_options(query: str, count: int = 5) -> str:
         notify_log("ERROR", "未配置 YOUTUBE_API_KEY")
         return json.dumps({"status": "error", "message": "未配置 YouTube API Key"}, ensure_ascii=False)
 
-    cleaned_q = clean_song_query(query)
+    cleaned_q, search_mode, relevance_language, region_code = prepare_search_query(query)
+    print(f"[YouTube 候选搜索] 查询词: '{cleaned_q}' 模式: {search_mode}", file=sys.stderr, flush=True)
     try:
         # 一次性预取 15 个候选项入池，以便用户说“换一批”时秒级切换（每批 5 首，共 3 批）
-        items = search_videos(cleaned_q, api_key, max_results=15)
+        items = search_videos(
+            cleaned_q,
+            api_key,
+            max_results=15,
+            relevance_language=relevance_language or None,
+            region_code=region_code or None,
+        )
         if not items and cleaned_q != query:
-            items = search_videos(query, api_key, max_results=15)
+            items = search_videos(
+                query,
+                api_key,
+                max_results=15,
+                relevance_language=relevance_language or None,
+                region_code=region_code or None,
+            )
 
         if not items:
             notify_log("NOT_FOUND", f"未找到候选: '{query}'")
