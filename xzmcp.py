@@ -30,30 +30,30 @@ SERVER_PORT = int(os.environ.get("SERVER_PORT", "8111"))
 # 支持统一前缀（如 http://music.sunjw.cn），默认使用本地局域网 IP 与端口
 BASE_URL = os.environ.get("BASE_URL", f"http://{LOCAL_IP}:{SERVER_PORT}").rstrip("/")
 
-# 2. 私有曲库数据。URL 必须能被 ESP32 直接访问并返回 MP3 数据。
+# 2. 私有曲库数据。URL 必须能被 ESP32 直接访问并返回 Ogg Opus 数据。
 MUSIC_LIBRARY = {
     "晴天": {
-        "url": f"{BASE_URL}/qingtian.mp3",
+        "url": f"{BASE_URL}/qingtian.ogg",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "稻香": {
-        "url": f"{BASE_URL}/daoxiang.mp3",
+        "url": f"{BASE_URL}/daoxiang.ogg",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "小燕子": {
-        "url": f"{BASE_URL}/xiaoyanzi.mp3",
+        "url": f"{BASE_URL}/xiaoyanzi.ogg",
         "artist": "未知",
         "genre": "未知"
     },
     "夜曲": {
-        "url": f"{BASE_URL}/yequ.mp3",
+        "url": f"{BASE_URL}/stream/yequ.ogg",
         "artist": "周杰伦",
         "genre": "流行"
     },
     "海阔天空": {
-        "url": f"{BASE_URL}/haikuotiankong.mp3",
+        "url": f"{BASE_URL}/stream/haikuotiankong.ogg",
         "artist": "Beyond",
         "genre": "摇滚"
     }
@@ -221,7 +221,7 @@ def search_youtube_and_stream(query: str) -> dict:
         except Exception as e:
             print(f"[YouTube 预缓冲请求异常] {e} (客户端直接请求时会自动触发流式缓冲)", file=sys.stderr, flush=True)
 
-        stream_url = f"{BASE_URL}/stream/{video_id}.mp3"
+        stream_url = f"{BASE_URL}/stream/{video_id}.ogg"
         return make_music_result(title, channel, stream_url)
     except Exception as e:
         print(f"[YouTube 搜索异常] {e}", file=sys.stderr, flush=True)
@@ -461,7 +461,7 @@ def play_selected_song(video_id_or_index: str, title: str = "") -> str:
     except Exception as e:
         print(f"[YouTube 预缓冲请求异常] {e}", file=sys.stderr, flush=True)
 
-    stream_url = f"{BASE_URL}/stream/{video_id}.mp3"
+    stream_url = f"{BASE_URL}/stream/{video_id}.ogg"
     return json.dumps(make_music_result(title or f"YouTube 音乐", "YouTube", stream_url), ensure_ascii=False)
 
 # --- 功能 3：直接点歌播放（无需选择，优先本地曲库，其次秒播 YouTube 第一条） ---
@@ -530,15 +530,19 @@ def list_music_library() -> str:
     meta = load_metadata()
     recent_songs = []
 
-    # 1. 扫描本地已缓存的完整 MP3 文件
+    # 1. 扫描本地已缓存的音频文件 (优先 Ogg Opus)
     if DOWNLOADS_DIR.exists():
         cached_files = sorted(
-            [p for p in DOWNLOADS_DIR.glob("*.mp3") if p.is_file()],
+            [p for p in DOWNLOADS_DIR.glob("*.*") if p.suffix in (".ogg", ".mp3") and p.is_file()],
             key=lambda x: x.stat().st_mtime,
             reverse=True
         )
+        seen_stems = set()
         for p in cached_files:
             vid = p.stem
+            if vid in seen_stems:
+                continue
+            seen_stems.add(vid)
             info = meta.get(vid, {})
             title = info.get("title", "")
             channel = info.get("channel", "YouTube 点播")
@@ -548,7 +552,7 @@ def list_music_library() -> str:
                 "title": title,
                 "channel": channel,
                 "video_id": vid,
-                "url": f"{BASE_URL}/stream/{vid}.mp3"
+                "url": f"{BASE_URL}/stream/{vid}{p.suffix}"
             })
 
     # 2. 追加本地精选常驻曲目（如晴天、稻香）
@@ -611,10 +615,12 @@ def play_random_music() -> str:
     meta = load_metadata()
     candidates = []
 
-    # 1. 收集本地已缓存的 MP3
+    # 1. 收集本地已缓存的音频 (优先 Ogg Opus)
     if DOWNLOADS_DIR.exists():
-        for p in DOWNLOADS_DIR.glob("*.mp3"):
-            if p.is_file():
+        seen = set()
+        for p in DOWNLOADS_DIR.glob("*.*"):
+            if p.is_file() and p.suffix in (".ogg", ".mp3") and p.stem not in seen:
+                seen.add(p.stem)
                 info = meta.get(p.stem, {})
                 title = info.get("title", f"音乐 {p.stem}")
                 channel = info.get("channel", "YouTube")
@@ -622,7 +628,7 @@ def play_random_music() -> str:
                     "title": title,
                     "channel": channel,
                     "video_id": p.stem,
-                    "url": f"{BASE_URL}/stream/{p.stem}.mp3"
+                    "url": f"{BASE_URL}/stream/{p.stem}{p.suffix}"
                 })
 
     # 2. 收集本地精选

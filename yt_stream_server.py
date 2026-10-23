@@ -65,14 +65,14 @@ def save_metadata(video_id: str, title: str, channel: str = ""):
 def cleanup_old_downloads(max_count: int = MAX_CACHED_SONGS):
     """当下载的音乐超过 max_count 首时，删除最早下载的文件，最多保留 max_count 首"""
     try:
-        mp3_files = [p for p in DOWNLOADS_DIR.glob("*.mp3") if p.is_file()]
-        if len(mp3_files) > max_count:
+        audio_files = [p for p in DOWNLOADS_DIR.glob("*.*") if p.suffix in (".mp3", ".ogg") and p.is_file()]
+        if len(audio_files) > max_count:
             # 按照修改时间从小到大排序（最旧的排在最前）
-            mp3_files.sort(key=lambda p: p.stat().st_mtime)
-            remove_count = len(mp3_files) - max_count
+            audio_files.sort(key=lambda p: p.stat().st_mtime)
+            remove_count = len(audio_files) - max_count
             meta = load_metadata()
             meta_changed = False
-            for p in mp3_files[:remove_count]:
+            for p in audio_files[:remove_count]:
                 try:
                     p.unlink(missing_ok=True)
                     if p.stem in meta:
@@ -114,7 +114,7 @@ def find_ffmpeg() -> str:
 FFMPEG_EXE = find_ffmpeg()
 
 class StreamSession:
-    """管理单首歌曲的 YouTube 下载与 MP3 实时流式转码"""
+    """管理单首歌曲的 YouTube 下载与 Ogg Opus 实时流式转码"""
     def __init__(self, video_id: str):
         self.video_id = video_id
         self.chunks = []
@@ -123,8 +123,8 @@ class StreamSession:
         self.done = False
         self.error = None
         self.total_bytes = 0
-        self.cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
-        self.tmp_file = DOWNLOADS_DIR / f"{video_id}.mp3.tmp"
+        self.cache_file = DOWNLOADS_DIR / f"{video_id}.ogg"
+        self.tmp_file = DOWNLOADS_DIR / f"{video_id}.ogg.tmp"
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -135,7 +135,7 @@ class StreamSession:
         tmp_fp = None
         try:
             tmp_fp = open(self.tmp_file, "wb")
-            print(f"[Stream] 启动 YouTube 实时音频流: {self.video_id}")
+            print(f"[Stream] 启动 YouTube 实时音频流 (Opus): {self.video_id}")
             # p1: yt-dlp 抓取最高音频流输出到 stdout
             p1 = subprocess.Popen([
                 sys.executable, "-m", "yt_dlp",
@@ -147,17 +147,19 @@ class StreamSession:
                 url
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-            # p2: ffmpeg 实时转码为与小智硬件完全匹配的单声道 24kHz 64kbps MP3
-            # （极低片上 SRAM 负荷，零软件重采样，内存占用减半，播放时长翻倍）
+            # p2: ffmpeg 实时转码为与小智原生底层完全匹配的单声道 24kHz 24kbps Ogg Opus
+            # （极低片上 SRAM 负荷，原生 esp_opus_dec 硬件级解码，彻底解决 MP3 内存耗尽断流）
             p2 = subprocess.Popen([
                 FFMPEG_EXE,
                 "-i", "pipe:0",
                 "-vn",
-                "-codec:a", "libmp3lame",
+                "-codec:a", "libopus",
                 "-ac", "1",
                 "-ar", "24000",
-                "-b:a", "64k",
-                "-f", "mp3",
+                "-b:a", "24k",
+                "-frame_duration", "60",
+                "-application", "audio",
+                "-f", "ogg",
                 "pipe:1"
             ], stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
@@ -203,8 +205,8 @@ class StreamSession:
                 self.done = True
                 self.cv.notify_all()
 
-    def wait_for_buffer(self, min_bytes=65536, timeout=8.0) -> bool:
-        """等待缓冲达到指定字节数 (默认 64KB 约 4-5 秒播放长度)"""
+    def wait_for_buffer(self, min_bytes=16384, timeout=8.0) -> bool:
+        """等待缓冲达到指定字节数 (默认 16KB 约 5 秒 24kbps Opus 播放长度)"""
         start = time.time()
         with self.lock:
             while self.total_bytes < min_bytes and not self.done and not self.error:
@@ -222,10 +224,11 @@ class StreamManager:
 
     def get_or_create(self, video_id: str) -> StreamSession:
         with self.lock:
-            # 如果本地已有完整文件，不需要启动流管道
-            if (DOWNLOADS_DIR / f"{video_id}.mp3").exists():
+            # 如果本地已有完整 ogg 或 mp3 文件，不需要启动流管道
+            has_cache = (DOWNLOADS_DIR / f"{video_id}.ogg").exists() or (DOWNLOADS_DIR / f"{video_id}.mp3").exists()
+            if has_cache:
                 return None
-            if video_id not in self.sessions or (self.sessions[video_id].done and not (DOWNLOADS_DIR / f"{video_id}.mp3").exists()):
+            if video_id not in self.sessions or (self.sessions[video_id].done and not has_cache):
                 self.sessions[video_id] = StreamSession(video_id)
             return self.sessions[video_id]
 
@@ -293,15 +296,20 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             if title:
                 save_metadata(video_id, title, channel)
 
-            cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
+            cache_file = DOWNLOADS_DIR / f"{video_id}.ogg"
+            if not cache_file.exists():
+                old_cache = DOWNLOADS_DIR / f"{video_id}.mp3"
+                if old_cache.exists():
+                    cache_file = old_cache
+
             if cache_file.exists():
                 add_log("PREPARE", f"预热命中本地缓存: {title or video_id}", "已存在完整文件")
                 self._send_json({"ok": True, "cached": True, "videoId": video_id})
                 return
 
             session = stream_manager.get_or_create(video_id)
-            # 等待 2.5 秒快速预缓冲约 32KB
-            ready = session.wait_for_buffer(min_bytes=32768, timeout=2.5) if session else True
+            # 等待 2.0 秒快速预缓冲约 16KB (24kbps Opus 约 5 秒)
+            ready = session.wait_for_buffer(min_bytes=16384, timeout=2.0) if session else True
             add_log("PREPARE", f"预热推流管道: {title or video_id}", f"buffered: {session.total_bytes if session else 0} B, ready={ready}")
             self._send_json({
                 "ok": True,
@@ -366,7 +374,7 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
                     "duration": item.get("duration", "未知"),
                     "thumbnail": thumb_url,
                     "cached": cached,
-                    "stream_url": f"/stream/{v_id}.mp3"
+                    "stream_url": f"/stream/{v_id}.ogg"
                 })
             self._send_json({"ok": True, "items": results, "total": len(results)})
         except Exception as e:
@@ -376,24 +384,30 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
         try:
             meta = load_metadata()
             cached_list = []
-            for p in sorted(DOWNLOADS_DIR.glob("*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True):
-                stat = p.stat()
-                m = meta.get(p.stem, {})
-                cached_list.append({
-                    "videoId": p.stem,
-                    "title": m.get("title", p.name),
-                    "channel": m.get("channel", "YouTube 点播"),
-                    "fileName": p.name,
-                    "sizeMb": round(stat.st_size / (1024 * 1024), 2),
-                    "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
-                    "streamUrl": f"/stream/{p.name}"
-                })
+            seen_stems = set()
+            for p in sorted(DOWNLOADS_DIR.glob("*.*"), key=lambda x: x.stat().st_mtime, reverse=True):
+                if p.is_file() and p.suffix in (".ogg", ".mp3") and p.stem not in seen_stems:
+                    seen_stems.add(p.stem)
+                    stat = p.stat()
+                    m = meta.get(p.stem, {})
+                    cached_list.append({
+                        "videoId": p.stem,
+                        "title": m.get("title", p.name),
+                        "channel": m.get("channel", "YouTube 点播"),
+                        "fileName": p.name,
+                        "sizeMb": round(stat.st_size / (1024 * 1024), 2),
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+                        "streamUrl": f"/stream/{p.name}"
+                    })
 
             static_list = []
             for fname, title, artist in [
-                ("qingtian.mp3", "晴天", "周杰伦"),
-                ("daoxiang.mp3", "稻香", "周杰伦"),
-                ("xiaoyanzi.mp3", "小燕子", "童谣")
+                ("qingtian.ogg", "晴天", "周杰伦"),
+                ("daoxiang.ogg", "稻香", "周杰伦"),
+                ("xiaoyanzi.ogg", "小燕子", "童谣"),
+                ("qingtian.mp3", "晴天 (MP3)", "周杰伦"),
+                ("daoxiang.mp3", "稻香 (MP3)", "周杰伦"),
+                ("xiaoyanzi.mp3", "小燕子 (MP3)", "童谣")
             ]:
                 fpath = ROOT_DIR / fname
                 if fpath.exists():
@@ -422,15 +436,27 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
         if not v_id:
             self._send_json({"ok": False, "error": "缺少 videoId"}, status=400)
             return
-        target = DOWNLOADS_DIR / f"{v_id}.mp3"
-        if target.exists():
+        deleted = False
+        for ext in [".ogg", ".mp3"]:
+            target = DOWNLOADS_DIR / f"{v_id}{ext}"
+            if target.exists():
+                try:
+                    target.unlink()
+                    deleted = True
+                except Exception as e:
+                    self._send_json({"ok": False, "error": str(e)}, status=500)
+                    return
+        if deleted:
             try:
-                target.unlink()
-                self._send_json({"ok": True, "message": f"已删除 {v_id}.mp3"})
-                return
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e)}, status=500)
-                return
+                meta = load_metadata()
+                if v_id in meta:
+                    del meta[v_id]
+                    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            self._send_json({"ok": True, "message": f"已删除 {v_id}"})
+            return
         self._send_json({"ok": False, "error": "文件不存在"}, status=404)
 
     def handle_youtube_stream(self, parsed):
@@ -449,14 +475,20 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             return
 
         client_ip = self.client_address[0] if self.client_address else "未知"
-        cache_file = DOWNLOADS_DIR / f"{video_id}.mp3"
+        cache_file = DOWNLOADS_DIR / f"{video_id}.ogg"
+        if not cache_file.exists():
+            old_cache = DOWNLOADS_DIR / f"{video_id}.mp3"
+            if old_cache.exists():
+                cache_file = old_cache
+
         # A. 命中本地缓存，直接以静态文件高效发送
         if cache_file.exists():
             size_mb = round(cache_file.stat().st_size / 1048576, 2)
-            add_log("STREAM", f"设备 {client_ip} 播放缓存: {video_id}.mp3", f"{size_mb} MB (本地秒开)")
+            content_type = "audio/ogg" if cache_file.suffix == ".ogg" else "audio/mpeg"
+            add_log("STREAM", f"设备 {client_ip} 播放缓存: {cache_file.name}", f"{size_mb} MB (本地秒开)")
             print(f"[HTTP] 命中本地完整缓存，秒级发送: {cache_file.name}")
             self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(cache_file.stat().st_size))
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
@@ -465,16 +497,16 @@ class MusicStreamHandler(SimpleHTTPRequestHandler):
             return
 
         # B. 动态分块推流 (Transfer-Encoding: chunked)
-        add_log("STREAM", f"设备 {client_ip} 请求推流: {video_id}.mp3", "HTTP 1.1 Chunked 边下边推")
-        print(f"[HTTP] 建立分块流式连接 (Chunked): {video_id}")
+        add_log("STREAM", f"设备 {client_ip} 请求推流: {video_id}.ogg", "HTTP 1.1 Chunked 边下边推 (Opus)")
+        print(f"[HTTP] 建立分块流式连接 (Chunked Opus): {video_id}")
         session = stream_manager.get_or_create(video_id)
         if session:
-            # 确保至少有 32KB 初始缓冲
-            session.wait_for_buffer(min_bytes=32768, timeout=8.0)
+            # 确保至少有 16KB 初始缓冲 (约 5 秒)
+            session.wait_for_buffer(min_bytes=16384, timeout=8.0)
 
         self.protocol_version = "HTTP/1.1"
         self.send_response(200)
-        self.send_header("Content-Type", "audio/mpeg")
+        self.send_header("Content-Type", "audio/ogg")
         self.send_header("Transfer-Encoding", "chunked")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
