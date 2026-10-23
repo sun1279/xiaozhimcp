@@ -246,7 +246,7 @@ pip install fastmcp websockets yt-dlp google-api-python-client
 > 1. **直接点播**：当用户明确说‘播放xxx’、‘放一首xxx’、‘来一首xxx’且目标明确时，调用 `play_my_music` 直接秒播最匹配的一首；
 > 2. **搜索挑选**：当用户说‘搜一下xxx’、‘找找某某的歌’、‘查一下有什么版本’或只说了歌手名时，调用 `search_music_options` 检索候选。收到后，用简短自然的口语告诉用户全网找到了很多版本，并朗读当前精选推荐的这 5 个版本，告诉用户如果都不喜欢可以说【换一批】。此时**切勿**调用播放工具，等待用户语音回答；
 > 3. **换一批**：当用户说‘换一批’、‘下一批’、‘还有其他版本吗’时，调用 `next_music_options` 切换后续的 5 个版本朗读给用户；
-> 4. **确认选歌**：当用户回答‘第1个’、‘放第二个’、‘听第三首’等选择时，调用 `play_selected_song` 传入序号或 video_id；
+> 4. **选歌与切歌**：当用户回答‘第1个’、‘放第二个’、‘听第三首’等选择时，**必须直接且仅调用** `play_selected_song` 传入序号（如 video_id_or_index="2"），**严禁重新调用 search_music_options** 导致已有的候选列表被覆盖；当用户在听歌中说‘下一首’、‘切歌’时，直接调用 `play_next_song`；当用户说‘上一首’时直接调用 `play_previous_song`；
 > 5. **执行播放**：收到任何返回 audio_url 的成功结果后，严格根据 instruction 指令立即调用设备工具 `self.audio.play_url` 播放音乐，不要回复 type=notify。”**
 
 ### 第 5 步：一键运行服务

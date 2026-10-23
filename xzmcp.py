@@ -3,6 +3,8 @@ warnings.filterwarnings("ignore", message=".*IncompleteFieldDefinitionWarning.*"
 warnings.filterwarnings("ignore", message=".*lifespan.*")
 import os
 import sys
+import time
+import re
 import json
 import random
 import urllib.request
@@ -73,8 +75,8 @@ def make_music_result(song_name: str, artist: str, audio_url: str) -> dict:
         "artist": artist,
         "audio_url": audio_url,
         "instruction": (
-            "请立即调用设备工具 self.audio.play_url，"
-            "arguments.url 使用 audio_url 的值；不要发送 type=notify。"
+            "请立即调用设备工具 self.audio.play_url，arguments.url 使用 audio_url 的值；不要发送 type=notify。\n"
+            "【重要控制说明】当前搜索候选歌曲列表已在服务端常驻保留。用户在播放中或后续若说“播放第二个”、“放第3首”等序号指令，请直接调用 play_selected_song；若用户说“下一首”、“切歌”，请直接调用 play_next_song；切勿重新调用 search_music_options！"
         ),
         "message": f"已找到歌曲《{song_name}》- {artist}"
     }
@@ -229,28 +231,51 @@ def search_youtube_and_stream(query: str) -> dict:
         return {"status": "error", "message": f"YouTube 搜索异常: {e}"}
 
 LAST_SEARCH_OPTIONS = []
+CURRENT_PLAYING_INDEX = -1
 
 def parse_choice_index(text: str) -> int | None:
     """尝试从自然语言文本解析用户选择的序号（0-indexed）"""
     t = text.strip()
-    patterns = [
-        (0, ["1", "一", "第一", "首个", "1号"]),
-        (1, ["2", "二", "两", "第二", "2号"]),
-        (2, ["3", "三", "第三", "3号"]),
-        (3, ["4", "四", "第四", "4号"]),
-        (4, ["5", "五", "第五", "5号"]),
-    ]
-    # 优先匹配“第X”、“选X”、“听X”、“放X”、“来X”
-    for idx, keywords in patterns:
-        for kw in keywords:
-            for verb in ["第", "选", "听", "放", "来", "要"]:
-                if f"{verb}{kw}" in t:
-                    return idx
-    # 精确或短文本包含
-    for idx, keywords in patterns:
-        for kw in keywords:
-            if t == kw or (kw in t and len(t) <= 6):
-                return idx
+    if any(p in t for p in ["下一", "上一", "来一首", "放一首", "唱一首", "找一首", "搜一首", "换一"]):
+        return None
+
+    num_map = {
+        "1": 0, "一": 0,
+        "2": 1, "二": 1, "两": 1,
+        "3": 2, "三": 2,
+        "4": 3, "四": 3,
+        "5": 4, "五": 4,
+        "6": 5, "六": 5,
+        "7": 6, "七": 6,
+        "8": 7, "八": 7,
+        "9": 8, "九": 8,
+        "10": 9, "十": 9
+    }
+    # 1. 纯数字/单字命中
+    if t in num_map:
+        return num_map[t]
+
+    # 2. 带“第X”：如 第2个, 第二个, 第二首, 第2, 第二
+    m = re.search(r'第\s*(10|[1-9]|[一二两三四五六七八九十])(?:个|首|号|曲|项|版)?', t)
+    if m:
+        digit = m.group(1)
+        if digit in num_map:
+            return num_map[digit]
+
+    # 3. 带“选/放/听/播/播放/点 X 个/首/号/版本”：如 放2, 播放第二个, 选3, 听第2首, 放第1个
+    m = re.search(r'(?:选|放|播放|听|播|点)\s*(?:第)?\s*(10|[1-9]|[一二两三四五六七八九十])(?:\s*(?:个|首|号|曲|项|版))?', t)
+    if m:
+        digit = m.group(1)
+        if digit in num_map:
+            return num_map[digit]
+
+    # 4. 带“X号”：如 1号, 2号
+    m = re.search(r'(10|[1-9]|[一二两三四五六七八九十])\s*号', t)
+    if m:
+        digit = m.group(1)
+        if digit in num_map:
+            return num_map[digit]
+
     return None
 
 SEARCH_CACHE_ALL_ITEMS = []
@@ -300,7 +325,8 @@ def format_page_options(query: str, page_idx: int) -> dict:
             f"【播报指引】全网共搜到了海量版本，已为用户精选出第 {page_num} 批候选（共 5 首）：\n"
             f"{'; '.join(readable_list)}。\n"
             "【语言表达要求】请用亲切自然的口语告诉用户：'在全网为您找到了许多相关版本，精选推荐前 5 个：1. xxx 2. xxx ... 5. xxx。您想听第几个？如果都不喜欢，也可以对我说【换一批】。'\n"
-            "【严禁】切勿在此时调用设备播放工具 self.audio.play_url，等待用户回答序号（如“第1个”、“放第二个”）、说出歌名或说【换一批】。"
+            "【严禁】切勿在此时调用设备播放工具 self.audio.play_url，等待用户回答序号（如“第1个”、“放第二个”）、说出歌名或说【换一批】。\n"
+            "【重要选歌/切歌指引】此候选列表已常驻保留！用户回答序号（如“第1个”、“播放第二个”、“听第三首”）时，请直接且仅调用 play_selected_song(video_id_or_index='...')；若用户说“下一首”请调用 play_next_song；绝对严禁重新调用 search_music_options！"
         )
     }
 
@@ -308,15 +334,31 @@ def format_page_options(query: str, page_idx: int) -> dict:
 @mcp.tool()
 def search_music_options(query: str, count: int = 5) -> str:
     """
-    【搜索歌曲/候选版本挑选】当用户要求“搜索歌曲”、“找找某某的歌”、“搜一下xxx”、“有哪些版本”、“查一下某歌”或泛指歌手名时调用。
+    【搜索歌曲/候选版本挑选】当用户要求“搜索歌曲”、“找找某某的歌”、“搜一下xxx”、“有哪些版本”、“查一下某歌”或歌手名时调用。
     全网检索海量版本，默认精选推荐前 5 个版本念给用户听并等待用户挑选；用户也可说“换一批”。
-    如果用户明确要求英文歌、英语内容或 English songs，优先将 query 组织为英文检索词；如果用户要求中文内容，保持中文检索词。
+    【严禁在选歌/切歌时调用】当用户说“播放第二个”、“放第X个”、“选第几个”、“听第3首”、“下一首”、“切歌”时，绝对严禁调用本工具（否则会覆盖清空现有候选列表）！选歌请调用 play_selected_song，切歌请调用 play_next_song！
     :param query: 想要搜索的歌曲关键词、歌名或歌手名
     :param count: 候选数量，默认 5 首
     """
-    global SEARCH_CACHE_ALL_ITEMS, SEARCH_CACHE_PAGE, CURRENT_SEARCH_QUERY
+    global SEARCH_CACHE_ALL_ITEMS, SEARCH_CACHE_PAGE, CURRENT_SEARCH_QUERY, LAST_SEARCH_OPTIONS
     print(f"\n[DEBUG 搜索歌曲候选] query: '{query}', count={count}", file=sys.stderr, flush=True)
     notify_log("SEARCH", f"候选检索: '{query}'")
+
+    # 意图拦截 1：如果传入的 query 实际是选歌序号（如“第二个”、“第2首”、“播放第1个”）
+    choice_idx = parse_choice_index(query)
+    if choice_idx is not None and (LAST_SEARCH_OPTIONS or SEARCH_CACHE_ALL_ITEMS):
+        print(f"[DEBUG 意图拦截] search_music_options 收到序号选择: '{query}' -> 自动转为 play_selected_song\n", file=sys.stderr, flush=True)
+        return play_selected_song(str(choice_idx + 1))
+
+    # 意图拦截 2：如果传入的 query 是“下一首 / 切歌”
+    if any(phrase in query for phrase in ["下一首", "切歌", "换一首", "下一个", "放下一个", "播放下一个", "听下一个"]):
+        print(f"[DEBUG 意图拦截] search_music_options 收到下一首指令: '{query}' -> 自动转为 play_next_song\n", file=sys.stderr, flush=True)
+        return play_next_song()
+
+    # 意图拦截 3：如果传入的 query 是“换一批”
+    if any(phrase in query for phrase in ["换一批", "下一批", "换一组", "更多候选", "其他版本"]):
+        print(f"[DEBUG 意图拦截] search_music_options 收到换一批指令: '{query}' -> 自动转为 next_music_options\n", file=sys.stderr, flush=True)
+        return next_music_options()
 
     if not YOUTUBE_ENABLED:
         notify_log("ERROR", "YouTube 模块未启用")
@@ -413,31 +455,47 @@ def next_music_options() -> str:
 @mcp.tool()
 def play_selected_song(video_id_or_index: str, title: str = "") -> str:
     """
-    【播放用户选中的歌曲】当用户从之前 search_music_options 列出的候选中选定了某首歌（例如用户回答说“第1个”、“放第二个”、“听现场版”等）时调用。
-    :param video_id_or_index: 选中的序号（如 '1', '2' 或 '第1个'）或者对应的 YouTube 视频 ID (如 'nDchQNPuA0k')
+    【选歌播放工具】当用户从之前 search_music_options 候选列表中选定歌曲时调用（如用户说“播放第二个”、“放第1首”、“选第3个”、“听现场版”等）。
+    【必须直接调用】直接传入序号（如 '1', '2' 或 '第二个'）即可秒播！严禁在此之前调用 search_music_options！服务端的候选列表常驻保留。
+    :param video_id_or_index: 选中的序号（如 '1', '2' 或 '第二个'）或者对应的 YouTube 视频 ID (如 'nDchQNPuA0k')
     :param title: 歌曲标题（可选）
     """
-    global LAST_SEARCH_OPTIONS
+    global LAST_SEARCH_OPTIONS, SEARCH_CACHE_ALL_ITEMS, CURRENT_PLAYING_INDEX
     print(f"\n[DEBUG 播放选中歌曲] target: '{video_id_or_index}', title: '{title}'", file=sys.stderr, flush=True)
 
     target = str(video_id_or_index).strip()
+
+    # 兼容处理“下一首 / 切歌”
+    if any(phrase in target for phrase in ["下一首", "切歌", "换一首", "下一个", "放下一个", "播放下一个", "听下一个"]):
+        return play_next_song()
+
+    # 兼容处理“上一首”
+    if any(phrase in target for phrase in ["上一首", "上一个", "放上一个", "播放上一个", "听上一个"]):
+        return play_previous_song()
+
     video_id = target
     choice_idx = parse_choice_index(target)
 
     # 1. 序号索引解析
-    if choice_idx is not None and LAST_SEARCH_OPTIONS and 0 <= choice_idx < len(LAST_SEARCH_OPTIONS):
-        sel = LAST_SEARCH_OPTIONS[choice_idx]
-        if sel.get("url") and not sel.get("video_id"):
-            # 命中了本地内置常驻曲目（如晴天、稻香）
-            print(f"[DEBUG 播放内置常驻曲目] 《{sel['title']}》 -> {sel['url']}\n", file=sys.stderr, flush=True)
-            notify_log("LOCAL_HIT", f"选中本地内置: {sel['title']}")
-            return json.dumps(make_music_result(sel["title"], sel.get("channel", "精选曲库"), sel["url"]), ensure_ascii=False)
-        video_id = sel["video_id"]
-        title = title or sel["title"]
+    if choice_idx is not None:
+        CURRENT_PLAYING_INDEX = choice_idx
+        if LAST_SEARCH_OPTIONS and 0 <= choice_idx < len(LAST_SEARCH_OPTIONS):
+            sel = LAST_SEARCH_OPTIONS[choice_idx]
+            if sel.get("url") and not sel.get("video_id"):
+                print(f"[DEBUG 播放内置常驻曲目] 《{sel['title']}》 -> {sel['url']}\n", file=sys.stderr, flush=True)
+                notify_log("LOCAL_HIT", f"选中本地内置: {sel['title']}")
+                return json.dumps(make_music_result(sel["title"], sel.get("channel", "精选曲库"), sel["url"]), ensure_ascii=False)
+            video_id = sel["video_id"]
+            title = title or sel["title"]
+        elif SEARCH_CACHE_ALL_ITEMS and 0 <= choice_idx < len(SEARCH_CACHE_ALL_ITEMS):
+            sel = SEARCH_CACHE_ALL_ITEMS[choice_idx]
+            video_id = sel["video_id"]
+            title = title or sel["title"]
     elif len(video_id) != 11 and LAST_SEARCH_OPTIONS:
         # 2. 如果不是11位ID，尝试按标题关键字模糊匹配
-        for opt in LAST_SEARCH_OPTIONS:
+        for idx, opt in enumerate(LAST_SEARCH_OPTIONS):
             if target.lower() in opt["title"].lower() or (title and title.lower() in opt["title"].lower()):
+                CURRENT_PLAYING_INDEX = idx
                 if opt.get("url") and not opt.get("video_id"):
                     return json.dumps(make_music_result(opt["title"], opt.get("channel", "精选曲库"), opt["url"]), ensure_ascii=False)
                 video_id = opt["video_id"]
@@ -464,6 +522,68 @@ def play_selected_song(video_id_or_index: str, title: str = "") -> str:
     stream_url = f"{BASE_URL}/stream/{video_id}.ogg"
     return json.dumps(make_music_result(title or f"YouTube 音乐", "YouTube", stream_url), ensure_ascii=False)
 
+# --- 功能 2.1：播放下一首/切歌 ---
+@mcp.tool()
+def play_next_song() -> str:
+    """
+    【播放下一首/切歌】当用户在听歌过程中或选歌后说“下一首”、“切歌”、“换一首”、“播放下一个”时调用。
+    自动在当前候选歌曲列表中按顺序无缝切换到下一首播放。
+    """
+    global CURRENT_PLAYING_INDEX, LAST_SEARCH_OPTIONS, SEARCH_CACHE_ALL_ITEMS
+    print(f"\n[DEBUG 播放下一首] 当前播放索引: {CURRENT_PLAYING_INDEX}, 候选池: {len(LAST_SEARCH_OPTIONS)}", file=sys.stderr, flush=True)
+    notify_log("MCP_CALL", "播放下一首")
+
+    if not LAST_SEARCH_OPTIONS and not SEARCH_CACHE_ALL_ITEMS:
+        return json.dumps({
+            "status": "no_songs",
+            "message": "当前没有正在播放的候选歌单，请先告诉我您想听什么歌，例如‘搜一下宝宝音乐’！"
+        }, ensure_ascii=False)
+
+    next_idx = CURRENT_PLAYING_INDEX + 1
+    if LAST_SEARCH_OPTIONS and next_idx < len(LAST_SEARCH_OPTIONS):
+        sel = LAST_SEARCH_OPTIONS[next_idx]
+        CURRENT_PLAYING_INDEX = next_idx
+        return play_selected_song(sel.get("video_id") or str(next_idx + 1), sel.get("title", ""))
+    elif SEARCH_CACHE_ALL_ITEMS and next_idx < len(SEARCH_CACHE_ALL_ITEMS):
+        sel = SEARCH_CACHE_ALL_ITEMS[next_idx]
+        CURRENT_PLAYING_INDEX = next_idx
+        return play_selected_song(sel.get("video_id", ""), sel.get("title", ""))
+    else:
+        # 已到末尾，循环回第 1 首
+        CURRENT_PLAYING_INDEX = 0
+        if LAST_SEARCH_OPTIONS:
+            sel = LAST_SEARCH_OPTIONS[0]
+            return play_selected_song(sel.get("video_id") or "1", sel.get("title", ""))
+        return json.dumps({"status": "end_of_playlist", "message": "已播放完全部候选歌曲"}, ensure_ascii=False)
+
+# --- 功能 2.2：播放上一首 ---
+@mcp.tool()
+def play_previous_song() -> str:
+    """
+    【播放上一首】当用户在听歌过程中说“上一首”、“放前一个”、“重播上一首”时调用。
+    自动在当前候选歌曲列表中按顺序切换到上一首播放。
+    """
+    global CURRENT_PLAYING_INDEX, LAST_SEARCH_OPTIONS, SEARCH_CACHE_ALL_ITEMS
+    print(f"\n[DEBUG 播放上一首] 当前播放索引: {CURRENT_PLAYING_INDEX}", file=sys.stderr, flush=True)
+    notify_log("MCP_CALL", "播放上一首")
+
+    if not LAST_SEARCH_OPTIONS and not SEARCH_CACHE_ALL_ITEMS:
+        return json.dumps({
+            "status": "no_songs",
+            "message": "当前没有正在播放的候选歌单，请先告诉我您想听什么歌！"
+        }, ensure_ascii=False)
+
+    prev_idx = max(0, CURRENT_PLAYING_INDEX - 1)
+    CURRENT_PLAYING_INDEX = prev_idx
+    if LAST_SEARCH_OPTIONS and prev_idx < len(LAST_SEARCH_OPTIONS):
+        sel = LAST_SEARCH_OPTIONS[prev_idx]
+        return play_selected_song(sel.get("video_id") or str(prev_idx + 1), sel.get("title", ""))
+    elif SEARCH_CACHE_ALL_ITEMS and prev_idx < len(SEARCH_CACHE_ALL_ITEMS):
+        sel = SEARCH_CACHE_ALL_ITEMS[prev_idx]
+        return play_selected_song(sel.get("video_id", ""), sel.get("title", ""))
+    else:
+        return json.dumps({"status": "already_first", "message": "已经是第一首歌曲了"}, ensure_ascii=False)
+
 # --- 功能 3：直接点歌播放（无需选择，优先本地曲库，其次秒播 YouTube 第一条） ---
 @mcp.tool()
 def play_my_music(song_name: str) -> str:
@@ -479,6 +599,16 @@ def play_my_music(song_name: str) -> str:
     if any(phrase in song_name for phrase in ["换一批", "下一批", "换一组", "下一页", "更多版本", "其他版本", "还有吗", "还有别的吗"]):
         print(f"[DEBUG 自动重定向] 识别到换一批指令: '{song_name}' -> 触发 next_music_options()\n", file=sys.stderr, flush=True)
         return next_music_options()
+
+    # 兼容容错 1.1：如果用户说“下一首/切歌”，而模型误调了 play_my_music
+    if any(phrase in song_name for phrase in ["下一首", "切歌", "换一首", "下一个", "放下一个", "播放下一个", "听下一个"]):
+        print(f"[DEBUG 自动重定向] 识别到下一首指令: '{song_name}' -> 触发 play_next_song()\n", file=sys.stderr, flush=True)
+        return play_next_song()
+
+    # 兼容容错 1.2：如果用户说“上一首”，而模型误调了 play_my_music
+    if any(phrase in song_name for phrase in ["上一首", "上一个", "放上一个", "播放上一个", "听上一个"]):
+        print(f"[DEBUG 自动重定向] 识别到上一首指令: '{song_name}' -> 触发 play_previous_song()\n", file=sys.stderr, flush=True)
+        return play_previous_song()
 
     # 兼容容错 2：如果用户在上一轮多选后回答“第1个”，而模型误调了 play_my_music
     choice_idx = parse_choice_index(song_name)
