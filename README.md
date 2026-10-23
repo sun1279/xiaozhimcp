@@ -30,11 +30,12 @@
 
 ## 一、 核心特性与亮点
 
-- ⚡ **毫秒级起播（首包预热缓冲）**：利用 `/api/prepare` 接口在 MCP 响应期间预先填充 64KB 内存首包，ESP32 发起连接即可秒级出声，无需等待全曲下载。
+- ⚡ **毫秒级起播（首包预热缓冲）**：利用 `/api/prepare` 接口在 MCP 响应期间预先填充 16KB 内存首包，ESP32 发起连接即可秒级出声，无需等待全曲下载。
 - 🌐 **全网海量曲库无缝检索**：对接 YouTube Data API，本地没有的冷门歌曲、欧美流行、日韩音乐皆可张口即来。
 - 🔄 **HTTP 1.1 分块流式传输 (`Transfer-Encoding: chunked`)**：通过 `yt-dlp` 与 `ffmpeg` 进程管道直通级联，彻底解决传统静态下载由于 `Content-Length` 错误导致的提前截断或超时断流。
-- 💾 **智能磁盘保护（FIFO 淘汰策略，上限 40 首）**：自动监控缓存目录，存满 40 首后自动清理最早下载的文件，并定期回收异常中断遗留的 `.tmp` 临时碎片。
-- 🚀 **双路复用写盘与二次点播秒开**：推流过程静默落盘至 `downloads/<videoId>.mp3`，再次点播同一歌曲时直接走本地静态直链，零网络流量损耗。
+- 🎵 **小智原生轻量级 Ogg Opus 格式架构**：全链路采用单声道 24kHz / 24kbps / 60ms 帧长的 Ogg Opus 编码，体积缩减 75%；完美契合芯片硬件级 `esp_opus_dec` 解码器，彻底根治 MP3 软解码内存耗尽断流问题，支持连续长音频播放 1.5 小时以上。
+- 💾 **智能磁盘保护（FIFO 淘汰策略，上限 40 首）**：自动监控缓存目录（全面兼容 `.ogg` 与 `.mp3`），存满 40 首后自动清理最早下载的文件，并同步清理元数据与异常中断遗留的 `.tmp` 临时碎片。
+- 🚀 **双路复用写盘与二次点播秒开**：推流过程静默落盘至 `downloads/<videoId>.ogg`，再次点播同一歌曲时直接走本地静态直链，零网络流量损耗。
 - 🛡️ **安全规范**：Token 凭证、本地端点文件已严格列入 `.gitignore`，避免任何敏感鉴权泄漏。
 
 ---
@@ -66,7 +67,7 @@
                  │                                                                 │
                  │                                                    调用 youtubeApi 检索 VideoID
                  │                                                                 │
-                 │                                                    调用 /api/prepare 预缓冲 64KB
+                 │                                                    调用 /api/prepare 预缓冲 16KB
                  │                                                                 │
                  └────────────────────────────────┬────────────────────────────────┘
                                                   │
@@ -76,7 +77,7 @@
                                                   ▼
 [小智 ESP32 硬件] <───(下发设备控制报文)───────── [小智云端控制通道]
        │
-       │ (读取到 audio_url: http://192.168.50.220:8111/stream/<videoId>.mp3)
+       │ (读取到 audio_url: http://music.sunjw.cn/stream/<videoId>.ogg)
        │
        ▼
 [ESP32 发起 HTTP GET] ────> [本地流媒体服务 (yt_stream_server.py: 端口 8111)]
@@ -86,14 +87,14 @@
        │                                 【已缓存过该歌曲】    【首次点播：实时推流】
        │                                        │                 │
        │                                  直接读取本地文件    yt-dlp 管道传输至 ffmpeg 实时转码
-       │                                  (秒级直出)         HTTP 1.1 Chunked 边下边推
+       │                                  (秒级直出)         HTTP 1.1 Chunked 边下边推 (Opus)
        │                                        │                 │
-       │                                        │            同时写入 downloads/<videoId>.mp3
+       │                                        │            同时写入 downloads/<videoId>.ogg
        │                                        │            (存满 40 首触发 FIFO 自动清理)
        │                                        │                 │
-       │<──────────(分块接收 MP3 音频流)──────────┴─────────────────┘
+       │<──────────(分块接收 Ogg Opus 音频流)─────┴─────────────────┘
        ▼
-[ESP32 底层 MP3/I2S 模块] ──> [实时解码音频流并输出到扬声器放音]
+[ESP32 原生 esp_opus_dec] ──> [硬件级实时解码音频流并输出到扬声器放音]
 ```
 
 ---
@@ -106,17 +107,18 @@
 - 当歌曲还在后台下载时，文件大小在不断增长。如果发送当前已下载的几十 KB 作为 `Content-Length`，ESP32 播放器读取完毕后就会**立即断开连接**，导致音乐播几秒就停。
 - 若等待全曲彻底下载完毕后再返回，用户需要原地等待 15~30 秒，极易触发小智对话超时。
 
-#### ② 本项目解决方案：HTTP 1.1 Chunked 流式传输
+#### ② 本项目解决方案：HTTP 1.1 Chunked 流式传输与 Ogg Opus 硬件级解码
 [`yt_stream_server.py`](file:///C:/Users/26621/Documents/ChatGPT/music/yt_stream_server.py) 使用了以下技术闭环：
 1. **管道直连（Pipelining）**：
    - `yt-dlp`（通过 Android 移动端客户端协议）抓取音频流，输出到 `stdout`。
-   - `ffmpeg` 从标准输入读取数据流，实时转码为兼容性极佳的标准 MP3（128kbps），输出到 `stdout`。
+   - `ffmpeg` 从标准输入读取数据流，实时转码为与小智原生底层完全匹配的单声道 24kHz / 24kbps / 60ms 帧长的 **Ogg Opus**（`libopus`），输出到 `stdout`。
+   - **为什么不用 MP3？**：MP3 软解码长时间播放会大量占用片上内部 SRAM（最低跌破 188 字节），极易导致底层 WiFi/TCP 接收缓冲区耗尽并在 12MB 处断流；而 Ogg Opus 走 ESP32 原生集成的硬件级 `esp_opus_dec` 解码器，不仅体积比 MP3 小 75%，且内存极度平稳，彻底解决长音频断流。
 2. **分块传输编码（Transfer-Encoding: chunked）**：
-   - 响应头去除 `Content-Length`，设置 `Transfer-Encoding: chunked` 与 `Connection: keep-alive`。
+   - 响应头去除 `Content-Length`，设置 `Content-Type: audio/ogg`、`Transfer-Encoding: chunked` 与 `Connection: keep-alive`。
    - 内存维护分块队列，只要 `ffmpeg` 产生 16KB 数据，即刻封装为十六进制分块推向客户端，直至传输完毕发送 `0\r\n\r\n` 终止符。
 3. **RAM 预热缓冲（Pre-buffering）**：
-   - 在大模型组织语言回复的 3~4 秒间隙，MCP 会调用 `/api/prepare?v=<id>`。
-   - 流媒体服务预先缓冲 64KB（约 4~5 秒音频），使得 ESP32 建立连接后第一包数据能够**零延迟**抵达，彻底杜绝起播卡顿。
+   - 在大模型组织语言回复的 2~3 秒间隙，MCP 会调用 `/api/prepare?v=<id>`。
+   - 流媒体服务预先缓冲 16KB（在 24kbps Opus 下相当于约 5 秒音频），使得 ESP32 建立连接后第一包数据能够**零延迟**抵达，彻底杜绝起播卡顿。
 
 ---
 
@@ -124,9 +126,11 @@
 
 为防止长期点歌导致主机磁盘耗尽，服务内置了严密的容量防护逻辑：
 1. **容量限制**：设定最大缓存首数 `MAX_CACHED_SONGS = 40`。
-2. **淘汰策略**：
-   - 依据文件的最后修改/创建时间戳（`st_mtime`）进行排序；
-   - 当 `downloads/` 目录中的完整 `.mp3` 数量超过 40 首时，按**从旧到新（FIFO）**顺序批量删除最早下载的文件；
+2. **多格式兼容淘汰策略**：
+   - 自动扫描 `downloads/` 目录中的所有音频文件（同时兼容 `.ogg` 与旧 `.mp3`）；
+   - 依据文件的最后修改时间戳（`st_mtime`）进行从小到大排序；
+   - 当文件总数超过 40 首时，按**从旧到新（FIFO）**顺序批量删除最早下载的文件；
+   - 删除文件的同时同步清理 `metadata.json` 对应记录，实现无残留淘汰。
 3. **双重检测触发**：
    - **完成即检**：每首新歌曲推流落盘重命名完成后立即触发；
    - **启动自检**：服务每次启动运行时自动扫描清理历史冗余文件；
@@ -136,27 +140,27 @@
 
 ### 4. 双模分发与本地秒开机制
 
-- **本地私有曲库优先**：在 [`xzmcp.py`](file:///C:/Users/26621/Documents/ChatGPT/music/xzmcp.py) 中维护精选曲目（如周杰伦经典歌曲）。若命中本地曲目，直接返回本地静态直链，无任何外部 API 与网络消耗。
+- **本地私有曲库优先**：在 [`xzmcp.py`](file:///C:/Users/26621/Documents/ChatGPT/music/xzmcp.py) 中维护精选曲目（如周杰伦经典歌曲 `.ogg`）。若命中本地曲目，直接返回本地静态直链，无任何外部 API 与网络消耗。
 - **全网在线自动降级**：本地未命中时，自动进入 YouTube 检索与动态推流。
-- **热歌自动固化**：首次点播的 YouTube 歌曲在落盘后，下次点播同首歌时将直接作为静态文件秒发（支持 `Content-Length` 和断点续传），无需再次启动转码进程。
+- **热歌自动固化**：首次点播的 YouTube 歌曲在落盘为 `.ogg` 后，下次点播同首歌时将直接作为静态文件秒发（支持 `Content-Length` 和断点续传），无需再次启动转码进程。
 
 ---
 
 ### 5. 小智固件端交互机制 (`self.audio.play_url`)
 
-针对支持 MP3 硬件/软解码的小智固件，MCP 服务在识别到歌曲后返回定制动作报文：
+MCP 服务在识别到歌曲后返回定制动作报文：
 ```json
 {
   "status": "success",
   "song_name": "告白气球",
   "artist": "周杰伦",
-  "audio_url": "http://192.168.50.220:8111/stream/bu7nU9Mhpyo.mp3",
+  "audio_url": "http://music.sunjw.cn/stream/bu7nU9Mhpyo.ogg",
   "action": "play_audio",
   "instruction": "请立即调用设备工具 self.audio.play_url，arguments.url 使用 audio_url 的值；不要发送 type=notify。",
   "message": "已找到歌曲《告白气球》- 周杰伦"
 }
 ```
-大模型解析该指令后，会通过下行通道驱动 ESP32 调用自身的底层音频播放器播放目标 URL。
+大模型解析该指令后，会通过下行通道驱动 ESP32 调用自身底层播放器播放目标 URL。
 
 ---
 
@@ -165,13 +169,13 @@
 ```text
 music/
 ├── yt_stream_server.py      # 流媒体服务器：HTTP 1.1 Chunked 推流、预热 API、静态文件、40首自动清理
-├── xzmcp.py                 # MCP 核心服务：注册点歌工具、曲库匹配、调用 YouTube 检索
+├── xzmcp.py                 # MCP 核心服务：注册点歌工具、多语言识别、曲库匹配、调用 YouTube 检索
 ├── mcp_pipe.py              # WebSocket 桥接守护进程：双向管道连接小智官方云端网关与本地 stdio MCP
 ├── start_services.bat       # 一键启动批处理脚本（自动拉起流媒体服务与 MCP 桥接）
-├── downloads/               # 自动缓存目录：动态存储 YouTube 转码后的 MP3 歌曲（受 FIFO 保护）
-├── qingtian.mp3/.ogg        # 本地精选常驻曲目示例
-├── daoxiang.mp3/.ogg        # 本地精选常驻曲目示例
-├── xiaoyanzi.mp3/.ogg       # 本地精选常驻曲目示例
+├── downloads/               # 自动缓存目录：动态存储 YouTube 转码后的 Ogg/MP3 歌曲（受 FIFO 保护）
+├── qingtian.ogg/.mp3        # 本地精选常驻曲目示例
+├── daoxiang.ogg/.mp3        # 本地精选常驻曲目示例
+├── xiaoyanzi.ogg/.mp3       # 本地精选常驻曲目示例
 ├── 新建文本文档.txt          # 本地端点配置备份（仅在本地使用，已被 Git 忽略）
 ├── .gitignore               # 严格过滤 Token、缓存音频、临时文件等敏感信息
 └── README.md                # 完整技术架构与操作手册
@@ -181,14 +185,15 @@ music/
 
 | 模块 | 核心类 / 函数 | 功能说明 |
 | :--- | :--- | :--- |
-| **`yt_stream_server.py`** | `StreamSession` | 管理单个视频的 `yt-dlp` | `ffmpeg` 管道、内存分块队列与本地 `.tmp` 写入 |
+| **`yt_stream_server.py`** | `StreamSession` | 管理单个视频的 `yt-dlp` \| `ffmpeg` 管道、Ogg Opus 转码、内存分块队列与本地写入 |
 | | `StreamManager` | 线程安全的流会话单例管理，防止同一首歌并发重复转码 |
-| | `cleanup_old_downloads` | 扫描 `downloads/` 目录，超出 40 首时依据时间戳删除最旧文件 |
-| | `MusicStreamHandler` | 处理 `/api/prepare`、`/stream/<id>.mp3` 及常规静态文件路由 |
+| | `cleanup_old_downloads` | 扫描 `downloads/` 目录，超出 40 首时依据时间戳 FIFO 删除最旧文件并同步清理元数据 |
+| | `MusicStreamHandler` | 处理 `/api/prepare`、`/stream/<id>.ogg`、缓存管理及常规静态文件路由 |
 | **`xzmcp.py`** | `play_my_music` | 主入口工具：优先私有曲库，未命中自动转入 YouTube 搜索推流 |
-| | `search_and_play_youtube` | 专用全网点歌工具：专用于检索并播放 YouTube 音频 |
-| | `list_music_library` | 查询歌单工具：列出当前本地收录的歌曲 |
-| | `play_random_music` | 随机点歌工具：在本地精选曲库中随机抽选 |
+| | `search_music_options` | 智能候选工具：全网多语言检索并推荐前 5 个精选版本供用户语音选择 |
+| | `next_music_options` | 翻页轮换工具：支持“换一批”、“下一批”版本切换 |
+| | `list_music_library` | 查询歌单工具：列出当前本地已缓存的曲目及常驻歌曲 |
+| | `play_random_music` | 随机点歌工具：在本地已缓存与常驻曲库中随机抽选 |
 | **`mcp_pipe.py`** | `run_pipe` | 维持与 `wss://api.xiaozhi.me/mcp/?token=...` 的长连接，双向映射 stdio |
 
 ---
